@@ -6,6 +6,7 @@
 # EXPECTS: python 2.7.6
 ###
 
+import datetime
 import json
 
 class parse_obo():
@@ -29,13 +30,13 @@ class parse_obo():
             obo_handle.close()
 
     def reduce_list(self, go_list=[], weights={'is_a' : 1, 'branch' : 10}):
-        if not isinstance(weights, dict):
+        if not isinstance(weights, dict) or len(weights) < 2:
             print 'Provided weights must be stored as a non-empty dictionary'
             print 'with the following format:'
             print '  {'
             for relation in self.obo_relations:
-                print '    ' + str(relation) + ': weight,'
-            print '    branch: weight'
+                print "    '" + str(relation) + "': #,"
+            print "    'branch': #"
             print '  }'
             print 'If a relation is left out of the weights dictionary, it'
             print 'will be ignored while reducing the go_list.'
@@ -51,11 +52,12 @@ class parse_obo():
                 print str(k) + ' is not a valid relation type. (!)'
         return []
 
-    def find_luca(self, go_1, go_2):
+    def find_luca(self, go_1, go_2, weights):
         if ((go_1 in self.obo_detail and go_2 in self.obo_detail)
              and self.obo_detail[go_1]['root']
              and self.obo_detail[go_2]['root']
-             and (self.obo_detail[go_1]['root'] == self.obo_detail[go_2]['root'])):
+             and (self.obo_detail[go_1]['root'] ==
+                  self.obo_detail[go_2]['root'])):
             return ''
         else:
             return None
@@ -142,8 +144,11 @@ class parse_obo():
                         if synonyms:
                             cur_val['synonym'] = {}
                             for synonym in synonyms:
-                                plaintext, relation_type, _ = synonym.rsplit(' ', 2)
-                                cur_val['synonym'].setdefault(relation_type.lower(), []).append(plaintext)
+                                (plaintext,
+                                 relation_type,
+                                 _) = synonym.rsplit(' ', 2)
+                                cur_val['synonym'].setdefault(
+                                  relation_type.lower(), []).append(plaintext)
 
                         # If we have relationships, which appear in the form:
                         #     'relation go_id'
@@ -156,8 +161,10 @@ class parse_obo():
                             relationships = None
                         if relationships:
                             for relationship in relationships:
-                                relation_type, go_id = relationship.rsplit(' ', 1)
-                                cur_val.setdefault(relation_type, []).append(go_id)
+                                (relation_type,
+                                 go_id) = relationship.rsplit(' ', 1)
+                                cur_val.setdefault(
+                                  relation_type, []).append(go_id)
 
                         # As a final step, we store the cleaned dictionary.
                         self.obo_detail[cur_key] = cur_val
@@ -252,7 +259,28 @@ class parse_obo():
                     visited.add(n_id)
                     self.obo_detail[n_id]['root'] = r_id
                     self.obo_detail[n_id]['level'] = n_ht
-                    options.extend([(x,n_ht+1) for x in self.obo_detail[n_id]['contains'] - visited])
+                    options.extend(
+                      [(x,n_ht+1) for x in 
+                        self.obo_detail[n_id]['contains'] - visited]
+                    )
+
+        # As a final step, we perform simple cleaning of our header data.
+        for k, v in self.obo_header.items():
+            if isinstance(v, list) and len(v) == 1:
+                v = v[0]
+            self.obo_header[k] = v
+        
+        if 'date' in self.obo_header:
+            try:
+                self.date = datetime.datetime.strptime(
+                              self.obo_header['date'],
+                              "%d:%m:%Y %H:%M")
+                distance = (datetime.datetime.now() - self.date).total_seconds()
+                print 'Parsed GO ontology dump is {} hours old. ({} days)'.format(
+                        round(distance / 3600, 1), round(distance / 86400, 1))
+            except:
+                self.date = None
+                print 'Parsed GO ontology contained no date information. (!)'
 
 class SimpleSafeJSON(json.JSONEncoder):
     def default(self, obj, safe_method=repr):
