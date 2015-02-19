@@ -12,13 +12,21 @@ import json
 class parse_obo():
     def __init__(self, obo_root=['GO:0003674', 'GO:0005575', 'GO:0008150'],
                        obo_relations=['is_a', 'part_of', 'regulates'],
+                       obo_disjoint=['is_a'],
                        obo_path=None):
         # Note: the algorithms herein assume that those terms in
         #   self.obo_root are root nodes for the entire go graph,
         #   and that the relations listed in self.obo_relations
-        #   are used to traverse the go ontology.
+        #   are used to traverse the go ontology. self.obo_disjoint
+        #   contains those relations that separate the go ontology
+        #   into disjoint ontologies that link to a single root.
+        #   It should be a proper subset of self.obo_relations.
         self.obo_root = obo_root
         self.obo_relations = frozenset(obo_relations)
+        self.obo_disjoint = []
+        for d in obo_disjoint:
+            if d in self.obo_relations:
+                self.obo_disjoint.append(d)
         self.obo_header = {}
         self.obo_detail = {}
         obo_handle = self._prepare_file(obo_path)
@@ -29,14 +37,14 @@ class parse_obo():
         finally:
             obo_handle.close()
 
-    def reduce_list(self, go_list=[], weights={'is_a' : 1, 'branch' : 10}):
-        if not isinstance(weights, dict) or len(weights) < 2:
+    def reduce_list(self, go_list=[], branch=10, weights={'is_a' : 1}):
+        if (not isinstance(weights, dict)
+            or len(weights) < 1):
             print 'Provided weights must be stored as a non-empty dictionary'
             print 'with the following format:'
             print '  {'
             for relation in self.obo_relations:
                 print "    '" + str(relation) + "': #,"
-            print "    'branch': #"
             print '  }'
             print 'If a relation is left out of the weights dictionary, it'
             print 'will be ignored while reducing the go_list.'
@@ -47,20 +55,44 @@ class parse_obo():
             return None
         
         for k in weights:
-            if k not in self.obo_relations or k != 'branch':
+            if k not in self.obo_relations:
                 weights.pop(k)
                 print str(k) + ' is not a valid relation type. (!)'
         return []
 
-    def find_luca(self, go_1, go_2, weights):
-        if ((go_1 in self.obo_detail and go_2 in self.obo_detail)
-             and self.obo_detail[go_1]['root']
-             and self.obo_detail[go_2]['root']
-             and (self.obo_detail[go_1]['root'] ==
-                  self.obo_detail[go_2]['root'])):
-            return ''
-        else:
-            return None
+    def find_sgca(self, go_1, go_2, weights):
+        if set(weights.keys()) == set(self.obo_disjoint):
+            if ((go_1 in self.obo_detail and go_2 in self.obo_detail)
+                 and self.obo_detail[go_1]['root']
+                 and self.obo_detail[go_2]['root']
+                 and (self.obo_detail[go_1]['root'] ==
+                      self.obo_detail[go_2]['root'])):
+                pass
+            else:
+                return None
+
+        terms = {go_1 : None, go_2 : None}
+        for term in terms:
+            remaining = [(term, 0)]
+            options = {term : 0}
+            while remaining:
+                n_id, n_wt = remaining.pop()
+                for path in weights:
+                    if path in self.obo_detail[n_id]:
+                        for p_id in self.obo_detail[n_id][path]:
+                            options[p_id] = n_wt + weights[path]
+                            remaining.append((p_id, n_wt + weights[path]))
+            terms[term] = options
+        
+        res_id = None
+        res_score = float('inf')
+        for option in set(terms[go_1].keys()).intersection(terms[go_2].keys()):
+            option_score = terms[go_1][option]**2 + terms[go_2][option]**2
+            if option_score < res_score:
+                res_id = option
+                res_score = option_score
+        
+        return (res_id, res_score)
 
     def dump_obo_detail_to_file(self, filename='go-detail.json'):
         with open(filename, 'w') as fh:
@@ -260,7 +292,7 @@ class parse_obo():
                     self.obo_detail[n_id]['root'] = r_id
                     self.obo_detail[n_id]['level'] = n_ht
                     options.extend(
-                      [(x,n_ht+1) for x in 
+                      [(x, n_ht+1) for x in 
                         self.obo_detail[n_id]['contains'] - visited]
                     )
 
@@ -275,11 +307,14 @@ class parse_obo():
                 self.date = datetime.datetime.strptime(
                               self.obo_header['date'],
                               "%d:%m:%Y %H:%M")
+            except:
+                self.date = None
+            
+            if self.date:
                 distance = (datetime.datetime.now() - self.date).total_seconds()
                 print 'Parsed GO ontology dump is {} hours old. ({} days)'.format(
                         round(distance / 3600, 1), round(distance / 86400, 1))
-            except:
-                self.date = None
+            else:
                 print 'Parsed GO ontology contained no date information. (!)'
 
 class SimpleSafeJSON(json.JSONEncoder):
