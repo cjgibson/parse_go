@@ -6,8 +6,14 @@
 # EXPECTS: python 2.7.6
 ###
 
+# https://github.com/uqfoundation/pathos.git
+from pathos.multiprocessing import ProcessingPool as Pool
+import itertools
 import datetime
+import psutil
 import json
+import math
+import sys
 
 class parse_obo():
     def __init__(self, obo_root=['GO:0003674', 'GO:0005575', 'GO:0008150'],
@@ -60,7 +66,7 @@ class parse_obo():
                 print str(k) + ' is not a valid relation type. (!)'
         return []
 
-    def find_sgca(self, go_1, go_2, weights):
+    def find_lsca(self, go_1, go_2, weights):
         if set(weights.keys()) == set(self.obo_disjoint):
             if ((go_1 in self.obo_detail and go_2 in self.obo_detail)
                  and self.obo_detail[go_1]['root']
@@ -69,7 +75,7 @@ class parse_obo():
                       self.obo_detail[go_2]['root'])):
                 pass
             else:
-                return None
+                return (None, float('inf'))
 
         terms = {go_1 : None, go_2 : None}
         for term in terms:
@@ -114,6 +120,48 @@ class parse_obo():
                                 sort_keys=True,
                                 indent=2,
                                 separators=(',', ': ')))
+    
+    def _lsca_unittest(self, weights={'is_a' : 1,
+                                      'part_of' : 2,
+                                      'regulates' : 5}):
+        def cbrt(x):
+            return math.pow(x, 1.0/3.0)
+
+        def group(i, n):
+            it = iter(i)
+            while True:
+                group = tuple(itertools.islice(it, n))
+                if not group:
+                    return
+                yield list(group)
+        
+        def _find_lsca(go_1, go_2):
+            return self.find_lsca(go_1, go_2, weights)
+
+        # Will parallelize tomorrow.
+        threads = []
+        for _ in range(psutil.cpu_count()):
+            threads.append(None)
+
+        missing = {}
+        options = frozenset(self.obo_detail.keys())
+        tested = set()
+        count = 0
+        total = len(options)*(len(options)+1)*0.5
+        mod = math.floor(cbrt(total))
+        for _1 in options:
+            for _2 in group(options - tested, psutil.cpu_count()):
+                count += len(_2)
+                tmp_in = [(_1, __2) for __2 in _2]
+                # Submit task to thread here, collect results in res.
+                if math.fmod(count, mod) == 0.0:
+                    fprint('Processed %d of %d possible combinations. (%0.5f%%)',
+                           (count, total, float(count)/total))
+                for r_id, _ in res:
+                    if not r_id:
+                        missing.setdefault(_1, []).append(_2)
+            tested.add(_1)
+        return missing
 
     def _prepare_file(self, filepath=None):
         fh = None
@@ -316,6 +364,11 @@ class parse_obo():
                         round(distance / 3600, 1), round(distance / 86400, 1))
             else:
                 print 'Parsed GO ontology contained no date information. (!)'
+
+def fprint(s, f=()):
+    sys.stdout.write('\r')
+    sys.stdout.write(s.replace('\t', '    ') % f)
+    sys.stdout.flush()
 
 class SimpleSafeJSON(json.JSONEncoder):
     def default(self, obj, safe_method=repr):
