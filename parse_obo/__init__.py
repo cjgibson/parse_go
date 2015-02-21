@@ -6,8 +6,8 @@
 # EXPECTS: python 2.7.6
 ###
 
-# https://github.com/uqfoundation/pathos.git
-from pathos.multiprocessing import ProcessingPool as Pool
+import multiprocessing
+import threading
 import itertools
 import datetime
 import psutil
@@ -66,7 +66,9 @@ class parse_obo():
                 print str(k) + ' is not a valid relation type. (!)'
         return []
 
-    def find_lsca(self, go_1, go_2, weights):
+    def find_lsca(self, go_1, go_2, weights={'is_a' : 1,
+                                             'part_of' : 2,
+                                             'regulates' : 5}):
         if set(weights.keys()) == set(self.obo_disjoint):
             if ((go_1 in self.obo_detail and go_2 in self.obo_detail)
                  and self.obo_detail[go_1]['root']
@@ -86,8 +88,9 @@ class parse_obo():
                 for path in weights:
                     if path in self.obo_detail[n_id]:
                         for p_id in self.obo_detail[n_id][path]:
-                            options[p_id] = n_wt + weights[path]
-                            remaining.append((p_id, n_wt + weights[path]))
+                            if p_id not in options:
+                                options[p_id] = n_wt + weights[path]
+                                remaining.append((p_id, n_wt + weights[path]))
             terms[term] = options
         
         res_id = None
@@ -121,12 +124,15 @@ class parse_obo():
                                 indent=2,
                                 separators=(',', ': ')))
     
-    def _lsca_unittest(self, weights={'is_a' : 1,
-                                      'part_of' : 2,
-                                      'regulates' : 5}):
+    def _lsca_unittest(self,
+                       weights={'is_a' : 1,
+                                'part_of' : 2,
+                                'regulates' : 5},
+                       num_threads=None,
+                       verbose=False):
         def cbrt(x):
             return math.pow(x, 1.0/3.0)
-
+        
         def group(i, n):
             it = iter(i)
             while True:
@@ -137,11 +143,67 @@ class parse_obo():
         
         def _find_lsca(go_1, go_2):
             return self.find_lsca(go_1, go_2, weights)
+        
+        class print_thread(threading.Thread):
+            def __init__(self, p):
+                threading.Thread.__init__(self)
+                self.print_queue = p
+                self.last_caller = None
+                self.daemon = True
+            
+            def run(self):
+                while True:
+                    n, s, f = self.print_queue.get()
+                    if self.last_caller and n != self.last_caller:
+                        fprint('\n', None)
+                    self.last_caller = n
+                    fprint(s=s, f=f)
+        
+        class unittest_thread(multiprocessing.Process):
+            def __init__(self, i, r, p, name=None, verbose=False):
+                multiprocessing.Process.__init__(self)
+                self.internal_queue = i
+                self.response_queue = r
+                self.printing_queue = p
+                self.daemon = True
+                self.name = 'Process-' + str(self.pid)
+                self.verbose = verbose
+            
+            def run(self):
+                if self.verbose:
+                    self.printing_queue.put(
+                      (self.name,
+                       self.name + " active.",
+                       None)
+                    )
+                while True:
+                    n_1, n_2 = self.internal_queue.get()
+                    if self.verbose:
+                        self.printing_queue.put(
+                          (self.name,
+                           self.name + " has " + str((n_1, n_2)) + ".",
+                           None)
+                        )
+                    self.response_queue.put(_find_lsca(n_1, n_2))
 
-        # Will parallelize tomorrow.
+        thread_messages = multiprocessing.Queue()
+        thread_requests = multiprocessing.Queue()
+        thread_response = multiprocessing.Queue()
+        
+        if num_threads:
+            thread_count = num_threads
+        else:
+            thread_count = max(1, psutil.cpu_count()-2)
+        
         threads = []
-        for _ in range(psutil.cpu_count()):
-            threads.append(None)
+        print_thread = print_thread(thread_messages).start()
+        for _ in range(thread_count):
+            _t = unittest_thread(thread_requests,
+                                 thread_response,
+                                 thread_messages,
+                                 verbose=verbose)
+            threads.append(_t)
+            _t.start()
 
         missing = {}
         options = frozenset(self.obo_detail.keys())
@@ -149,15 +211,20 @@ class parse_obo():
         count = 0
         total = len(options)*(len(options)+1)*0.5
         mod = math.floor(cbrt(total))
+
         for _1 in options:
-            for _2 in group(options - tested, psutil.cpu_count()):
-                count += len(_2)
-                tmp_in = [(_1, __2) for __2 in _2]
-                # Submit task to thread here, collect results in res.
+            for _2 in group(options - tested, thread_count):
                 if math.fmod(count, mod) == 0.0:
-                    fprint('Processed %d of %d possible combinations. (%0.5f%%)',
-                           (count, total, float(count)/total))
-                for r_id, _ in res:
+                    thread_messages.put(
+                      ('MainThread',
+                       'Processed %d of %d possible combinations. (%0.5f%%)',
+                       (count, total, float(count)/total))
+                    )
+                for i in range(len(_2)):
+                    thread_requests.put((_1, _2[i]))
+                for i in range(len(_2)):
+                    r_id, _ = thread_response.get()
+                    count += 1
                     if not r_id:
                         missing.setdefault(_1, []).append(_2)
             tested.add(_1)
@@ -307,6 +374,8 @@ class parse_obo():
             if 'is_a' in self.obo_detail[g_id]:
                 for p_id in self.obo_detail[g_id]['is_a']:
                     self.obo_detail[p_id].setdefault('contains', set()).add(g_id)
+            if 'alt_id' in self.obo_detail[g_id]:
+                self.obo_detail[g_id]['alt_id'] = frozenset(self.obo_detail[g_id]['alt_id'])
         
         # After the set objects in our dictionary are finalized, we cast them
         #   as frozensets to improve comparison time. We also reduce each list
@@ -344,6 +413,11 @@ class parse_obo():
                         self.obo_detail[n_id]['contains'] - visited]
                     )
 
+        for g_id in self.obo_detail.keys():
+            if 'alt_id' in self.obo_detail[g_id]:
+                for a_id in self.obo_detail[g_id]['alt_id']:
+                    self.obo_detail[a_id] = self.obo_detail[g_id]
+
         # As a final step, we perform simple cleaning of our header data.
         for k, v in self.obo_header.items():
             if isinstance(v, list) and len(v) == 1:
@@ -366,6 +440,8 @@ class parse_obo():
                 print 'Parsed GO ontology contained no date information. (!)'
 
 def fprint(s, f=()):
+    if not f:
+        f = ()
     sys.stdout.write('\r')
     sys.stdout.write(s.replace('\t', '    ') % f)
     sys.stdout.flush()
