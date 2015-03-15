@@ -1,8 +1,8 @@
 ###
 # AUTHORS: CHRISTIAN GIBSON, 
-# PROJECT: GO EVOLVE
-# UPDATED: FEBURARY 18, 2015
-# USAGE:   from parse_obo import parse_obo ; o = parse_obo()
+# PROJECT: PARSE GO
+# UPDATED: MARCH 15, 2015
+# USAGE:   from parse_go import parse_obo ; go = parse_obo()
 # EXPECTS: python 2.7.6
 ###
 
@@ -761,11 +761,6 @@ class parse_obo():
                                   'GO:0034421', 'GO:0070526', 'GO:0001937']
 
     def reduce_list(self, go_list=[], branch_count=20, branch_penalty=10):
-        res = self._reduce_list(go_list, branch_count, branch_penalty)
-        
-        return res
-    
-    def _reduce_list(self, go_list, branch_count, branch_penalty):
         pass
     
     def find_lsca(self, go_1, go_2):

@@ -2114,9 +2114,9 @@ terms = """| GO:0005267 |         1 |
 | GO:0005524 |     38110 |
 | GO:0005515 |    116203 |"""
 
-import parse_obo
+import parse_go
 import json
-o = parse_obo.parse_obo()
+o = parse_go.parse_obo()
 important = 'GO:0005524'
 matches = {}
 terms = terms.split('\n')
