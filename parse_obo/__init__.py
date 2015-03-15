@@ -9,8 +9,10 @@
 from pympler.asizeof import asizeof
 import multiprocessing
 import threading
+import traceback
 import itertools
 import datetime
+import networkx
 import ctypes
 import psutil
 import Queue
@@ -20,10 +22,12 @@ import math
 import sys
 
 class parse_obo():
-    def __init__(self, obo_root=['GO:0003674', 'GO:0005575', 'GO:0008150'],
+    def __init__(self, weights={'is_a' : 1, 'part_of' : 2, 'regulates' : 5},
+                       obo_root=['GO:0003674', 'GO:0005575', 'GO:0008150'],
                        obo_relations=['is_a', 'part_of', 'regulates'],
                        obo_disjoint=['is_a'],
-                       obo_path=None):
+                       obo_path=None,
+                       save_detail=False):
         # Note: the algorithms herein assume that those terms in
         #   self.obo_root are root nodes for the entire go graph,
         #   and that the relations listed in self.obo_relations
@@ -31,6 +35,7 @@ class parse_obo():
         #   contains those relations that separate the go ontology
         #   into disjoint ontologies that link to a single root.
         #   It should be a proper subset of self.obo_relations.
+        self.weights = weights
         self.obo_root = obo_root
         self.obo_relations = frozenset(obo_relations)
         self.obo_disjoint = []
@@ -39,10 +44,13 @@ class parse_obo():
                 self.obo_disjoint.append(d)
         self.obo_header = {}
         self.obo_detail = {}
+        self.obo_graph = networkx.DiGraph()
+        self.save_detail = save_detail
         obo_handle = self._prepare_file(obo_path)
         try:
-            self._parse_file(obo_handle)
+            self._parse_file(obo_handle, save_detail)
         except:
+            print traceback.format_exc()
             pass
         finally:
             obo_handle.close()
@@ -752,8 +760,342 @@ class parse_obo():
                                   'GO:0016428', 'GO:0030128', 'GO:0045672',
                                   'GO:0034421', 'GO:0070526', 'GO:0001937']
 
-    def reduce_list(self, go_list=[], initial_branch_count=20,
-                    branch=10, weights={'is_a' : 1}):
+    def reduce_list(self, go_list=[], branch_count=20, branch_penalty=10):
+        res = self._reduce_list(go_list, branch_count, branch_penalty)
+        
+        return res
+    
+    def _reduce_list(self, go_list, branch_count, branch_penalty):
+        pass
+    
+    def find_lsca(self, go_1, go_2):
+        shared_root = None
+        scored_root = float('inf')
+        for root in self.obo_root:
+            if (networkx.has_path(self.obo_graph, go_1, root)
+                and networkx.has_path(self.obo_graph, go_2, root)):
+                scored_temp = networkx.shortest_path_length(self.obo_graph,
+                                                            go_1, root)**2
+                scored_temp+= networkx.shortest_path_length(self.obo_graph,
+                                                            go_2, root)**2
+                if scored_temp < scored_root:
+                    shared_root = root
+                    scored_root = scored_temp
+        if shared_root:
+            neighbor_set_1 = networkx.single_source_shortest_path_length(
+                                         self.obo_graph, go_1)
+            neighbor_set_2 = networkx.single_source_shortest_path_length(
+                                         self.obo_graph, go_2)
+            combined_set = set(neighbor_set_1.keys()).intersection(
+                                         set(neighbor_set_2.keys()))
+            if len(combined_set) > 0:
+                combined_set = [(go, (neighbor_set_1[go]**2
+                                      + neighbor_set_2[go]**2))
+                                for go in combined_set]
+                combined_set = sorted(combined_set, key=lambda x : x[1])
+                lsca_id, lsca_score = combined_set[0]
+                lsca_root_dist = networkx.shortest_path_length(self.obo_graph,
+                                                               lsca_id,
+                                                               shared_root)
+                return (lsca_id, lsca_score, lsca_root_dist)
+            else:
+                raise ValueError, ('It has been shown that both %s and %s share'
+                                   + ' a root at %s. As such, the intersection'
+                                   + ' of their neighboring node sets cannot be'
+                                   + ' empty.') % (go_1, go_2, shared_root)
+        else:
+            return (None, float('inf'), float('inf'))
+
+    def _prepare_file(self, filepath=None):
+        fh = None
+        try:
+            if filepath:
+                fh = open(filepath, 'r')
+            else:
+                try:
+                    fh = open('go.obo', 'r')
+                except:
+                    fh = open('go-basic.obo', 'r')
+        except:
+            try:
+                fh.close()
+            except:
+                pass
+            finally:
+                raise IOError("Cannot locate gene ontology source file.")
+        return fh
+
+    def _parse_file(self, fh, save_detail=False):
+        # Utilizing a networkx.DiGraph() over a simple dictionary saves
+        #    ~38% in terms of memory usage.
+        if save_detail is False:
+            save_detail = self.save_detail
+        
+        in_file = False
+        in_term = False
+        cur_key = None
+        cur_val = {}
+        
+        # Read the file, line-by-line, and filter the results into
+        #   a dictionary.
+        for line in fh:
+            # All information read prior to the first occurrence of a term
+            #   block is parsed in and recorded as header information. Once
+            #   We encounter our first term block, we consider ourselves to
+            #   have entered the body of the file, and the in_file flag is 
+            #   set to True.
+            if in_file:
+                # We consider ourself to be in the in_term state once we've
+                #   passed the OBO file header. 
+                #   (Once we observe the string '[Term]'.)
+                if in_term:
+                    # When we observe a line with nothing but a newline
+                    #   character, and are inside of a term block, we've
+                    #   finished parsing the term, and can clean the
+                    #   resulting dictionary.
+                    if '\n' == line:
+                        # We're no longer in a term block, so we set the
+                        #   term flag to False.
+                        in_term = False
+                        # If we have synonyms, which appear in the form:
+                        #     '"go_term" RELATION []'
+                        #   we split the string into its parts, and
+                        #   organize according to relation type.
+                        #   As a side note, the go_term in a synonym
+                        #   is encoded as an english phrase, rather than
+                        #   as a unique GO id, and the relation is stored
+                        #   as a completely capitalized string.
+                        if 'synonym' in cur_val:
+                            synonyms = cur_val.pop('synonym')
+                        else:
+                            synonyms = None
+                        if synonyms:
+                            cur_val['synonym'] = {}
+                            for synonym in synonyms:
+                                (plaintext,
+                                 relation_type,
+                                 _) = synonym.rsplit(' ', 2)
+                                cur_val['synonym'].setdefault(
+                                  relation_type.lower(), []).append(plaintext)
+
+                        # If we have relationships, which appear in the form:
+                        #     'relation go_id'
+                        #   we split the string into its parts, and organize
+                        #   according to the relation type. As a note, the
+                        #   linked go_id is the unique GO id.
+                        if 'relationship' in cur_val:
+                            relationships = cur_val.pop('relationship')
+                        else:
+                            relationships = None
+                        if relationships:
+                            for relationship in relationships:
+                                (relation_type,
+                                 go_id) = relationship.rsplit(' ', 1)
+                                cur_val.setdefault(
+                                  relation_type, []).append(go_id)
+                        
+                        modifiable = [cur_key] 
+                        
+                        if 'alt_id' in cur_val:
+                            for go_id in cur_val['alt_id']:
+                                self.obo_graph.add_cycle([cur_key, go_id],
+                                                         weight=0)
+                                modifiable.append(go_id)
+                        
+                        for go_src in modifiable:
+                            for relation in self.obo_relations:
+                                if relation in cur_val:
+                                    for go_id in cur_val[relation]:
+                                        self.obo_graph.add_edge(
+                                                  go_src, go_id,
+                                                  weight=self.weights[relation])
+
+                        # As a final step, we store the cleaned dictionary.
+                        if save_detail:
+                            self.obo_detail[cur_key] = cur_val
+                    # If the line contains anything besides a newline character,
+                    #   then we're currently in a term block.
+                    else:
+                        # Term attributes are stored in the following form:
+                        #     'attribute_type: attribute_value'
+                        #   We split the string into its parts, and store.
+                        try:
+                            k, v = [p.strip() for p in line.split(':', 1)]
+                        except:
+                            print line
+                            raise IOError(('Error encountered in parsing'
+                                           + ' OBO file.'))
+
+                        # Once we've found the id field, we know which go term
+                        #   we're currently reading.
+                        if k == 'id':
+                            cur_key = v
+                            self.obo_graph.add_node(v)
+                        # Occasionally, attributes have extra information:
+                        #     'attribute_type: attribute_value ! information'
+                        #   We remove this information during cleaning.
+                        else:
+                            v = v.split('!')[0].strip()
+                            cur_val.setdefault(k, []).append(v)
+                # If we aren't in a term block, but our line contains
+                #   '[Term]', we know we've entered a term block, and
+                #   set our boolean flags accordingly.
+                elif '[Term]' in line:
+                    in_term = True
+                    cur_key = None
+                    cur_val = {}
+            # If we aren't yet in the body of the file, we parse information
+            #   and record under the assumption that it is part of the file's
+            #   header.
+            else:
+                # This is a bit of a lazy check. In accordance with OBO format,
+                #   we know that each line will contain an attribute key value
+                #   pair. Once this no longer occurs, ergo, once Python fails
+                #   to split a line into two parts around a colon, we know we've
+                #   exited the header block.
+                try:
+                    k, v = [p.strip() for p in line.split(':', 1)]
+                    self.obo_header.setdefault(k, []).append(v)
+                except ValueError:
+                    in_file = True
+                except:
+                    print line
+                    raise IOError("Encountered unexpected line in OBO header.")
+        
+        if save_detail is True:
+            # As a cursory stage in the final cleaning process for the generated
+            #   obo_detail dictionary, we create new fields 'root' and 'level',
+            #   and generate a set of child terms using the 'is_a' relations
+            #   from each go term. This is then stored under the field name
+            #   'contains'.
+            for g_id in self.obo_detail:
+                self.obo_detail[g_id]['root'] = None
+                self.obo_detail[g_id]['level'] = None
+                if 'contains' not in self.obo_detail[g_id]:
+                    self.obo_detail[g_id]['contains'] = set()
+                if 'is_a' in self.obo_detail[g_id]:
+                    for p_id in self.obo_detail[g_id]['is_a']:
+                        self.obo_detail[p_id].setdefault('contains', 
+                                                         set()).add(g_id)
+                if 'alt_id' in self.obo_detail[g_id]:
+                    self.obo_detail[g_id]['alt_id'] = frozenset(
+                                            self.obo_detail[g_id]['alt_id'])
+            
+            # After the set objects in our dictionary are finalized, we cast
+            #   them as frozensets to improve comparison time. We also reduce
+            #   each list with one element to a single element. Typically the
+            #   reduced fields are 'def', 'name', and 'namespace'.
+            for g_id in self.obo_detail:
+                for k, v in self.obo_detail[g_id].items():
+                    if isinstance(v, set) or k in self.obo_relations:
+                        v = frozenset(v)
+                    elif isinstance(v, list) and len(v) == 1:
+                        v = v[0]
+                    self.obo_detail[g_id][k] = v
+            
+            # Lastly, we iterate over the dictionary using depth-first-search,
+            #   starting with each root node. In this way, we set the 'root'
+            #   and 'level' fields of each go term in our dictionary. We note
+            #   that we rely on the 'is_a' relations stored in the 'contains'
+            #   field when constructing our 'root' and 'level' fields; due to
+            #   this, we are ensured not to match multiple roots to the same
+            #   go term. For further information, see:
+            #     http://geneontology.org/page/ontology-structure#oneorthree
+            #   If a term is left without a 'root' and 'level' field following
+            #   this process, it is an obsolete term.
+            for r_id in self.obo_root:
+                visited = set()
+                options = [(r_id, 0)]
+                while options:
+                    n_id, n_ht = options.pop(0)
+                    if n_id not in visited:
+                        visited.add(n_id)
+                        self.obo_detail[n_id]['root'] = r_id
+                        self.obo_detail[n_id]['level'] = n_ht
+                        options.extend(
+                          [(x, n_ht+1) for x in 
+                            self.obo_detail[n_id]['contains'] - visited]
+                        )
+    
+            for g_id in self.obo_detail.keys():
+                if 'alt_id' in self.obo_detail[g_id]:
+                    for a_id in self.obo_detail[g_id]['alt_id']:
+                        self.obo_detail[a_id] = self.obo_detail[g_id]
+
+        # As a final step, we perform simple cleaning of our header data.
+        for k, v in self.obo_header.items():
+            if isinstance(v, list) and len(v) == 1:
+                v = v[0]
+            self.obo_header[k] = v
+        
+        if 'date' in self.obo_header:
+            try:
+                self.date = datetime.datetime.strptime(
+                              self.obo_header['date'],
+                              "%d:%m:%Y %H:%M")
+            except:
+                self.date = None
+            
+            if self.date:
+                distance = (datetime.datetime.now() 
+                            - self.date).total_seconds()
+                print (('Parsed GO ontology dump is %0.2f hours old. '
+                        + '(%0.1f days)')
+                       % (distance / 3600, distance / 86400))
+            else:
+                print 'Parsed GO ontology contained no date information. (!)'
+        
+        _bytes = float(asizeof(self))
+        _Mbytes = _bytes / 10**6
+        
+        print (('Memory used to store parse_obo object: %d bytes.'
+                + ' (%0.2f megabytes)')
+               % (_bytes, _Mbytes))
+
+    ### METHODS PAST THIS POINT REQUIRE OBO_DETAIL IN ORDER TO RUN ###
+
+    def dump_obo_detail_to_file(self, filename='go-detail.json'):
+        if not self.save_detail is True or self.obo_detail is {}:
+            raise NotImplementedError, ('Not implemented when save_detail flag'
+                                        + ' is set to False.')
+        
+        with open(filename, 'w') as fh:
+            fh.write(json.dumps(self.obo_detail,
+                                sort_keys=True,
+                                indent=2,
+                                separators=(',', ': '),
+                                cls=SimpleSafeJSON))
+
+    def dump_pseudotree_to_file(self, filename='go.json'):
+        if not self.save_detail is True or self.obo_detail is {}:
+            raise NotImplementedError, ('Not implemented when save_detail flag'
+                                        + ' is set to False.')
+        
+        tree = {}
+        for r in self.obo_root:
+            tree[r] = {}
+        for k, v in self.obo_detail.items():
+            if v['root']:
+                tree[v['root']].setdefault(v['level'], []).append(k)
+        with open(filename, 'w') as fh:
+            fh.write(json.dumps(tree,
+                                sort_keys=True,
+                                indent=2,
+                                separators=(',', ': ')))
+
+    ### METHODS PAST THIS POINT ARE DEPRECIATED AND RELY ON OBO_DETAIL ###
+
+    def reduce_list_by_detail(self, go_list=[], branch_count=20,
+                              branch_penalty=10, weights=None):
+        raise NotImplementedError
+        
+        if not self.save_detail is True or self.obo_detail is {}:
+            raise NotImplementedError, ('Not implemented when save_detail flag'
+                                        + ' is set to False.')
+        
+        if weights is None:
+            weights = self.weights
+        
         if (not isinstance(weights, dict)
             or len(weights) < 1):
             print 'Provided weights must be stored as a non-empty dictionary'
@@ -767,7 +1109,7 @@ class parse_obo():
             raise TypeError('User provided improperly formatted weights'
                             + ' dictionary.')
         
-        if not isinstance(go_list, (list, dict)) or len(go_list) == 0:
+        if not isinstance(go_list, list) or len(go_list) == 0:
             print ('Provided go_list must be a non-empty list or dictionary of '
                    + 'go terms.')
             return TypeError('User provided improperly formatted go term list.')
@@ -778,37 +1120,18 @@ class parse_obo():
                 print ('"' + str(k) + '" is not a valid relation type and will'
                        + ' be ignored. (!)')
         
-        if isinstance(go_list, dict):
-            go_list_lookup = go_list
-            go_list = go_list.keys()
-        else:
-            go_list_lookup = dict(zip(go_list, (1,) * len(go_list)))
-        
-        for t in go_list:
-            if t not in self.obo_detail:
-                print ('"' + t + '" is not a GO term id found in the provided '
-                       + 'OBO file and will be ignored. (!)')
-                go_list_lookup.pop(t)
-                go_list.remove(t)
-            if go_list_lookup[t] <= 0:
-                print ('"' + t + '" was associated with a zero or negative '
-                       + 'weight. Its weight has been adjusted to 1. (!)')
-                go_list_lookup[t] = 1
-        
-        res = self._reduce_list(go_list=go_list, go_weight=go_list_lookup,
-                                initial_branch_count=initial_branch_count,
-                                branch=branch, weights=weights)
+        res = self._reduce_list_by_detail(go_list, branch_count,
+                                          branch_penalty, weights)
         
         return res
-    
-    def _reduce_list(self, go_list, go_weight, initial_branch_count,
-                     branch, weights):
-        lookup = self._lsca_reduce(go_list, weights)
-        return lookup
 
-    def find_lsca(self, go_1, go_2, weights={'is_a' : 1,
-                                             'part_of' : 2,
-                                             'regulates' : 5}):
+    def find_lsca_by_detail(self, go_1, go_2, weights=None):
+        if not self.save_detail is True or self.obo_detail is {}:
+            raise NotImplementedError, ('Not implemented when save_detail flag'
+                                        + ' is set to False.')
+        
+        if weights is None:
+            weights = self.weights
         if set(weights.keys()) == set(self.obo_disjoint):
             if ((go_1 in self.obo_detail and go_2 in self.obo_detail)
                  and self.obo_detail[go_1]['root']
@@ -850,41 +1173,22 @@ class parse_obo():
                     res_score = option_score
         
         return (res_id, res_depth, res_score)
-
-    def dump_obo_detail_to_file(self, filename='go-detail.json'):
-        with open(filename, 'w') as fh:
-            fh.write(json.dumps(self.obo_detail,
-                                sort_keys=True,
-                                indent=2,
-                                separators=(',', ': '),
-                                cls=SimpleSafeJSON))
-
-    def dump_pseudotree_to_file(self, filename='go.json'):
-        tree = {}
-        for r in self.obo_root:
-            tree[r] = {}
-        for k, v in self.obo_detail.items():
-            if v['root']:
-                tree[v['root']].setdefault(v['level'], []).append(k)
-        with open(filename, 'w') as fh:
-            fh.write(json.dumps(tree,
-                                sort_keys=True,
-                                indent=2,
-                                separators=(',', ': ')))
     
-    def _lsca_unittest(self,
-                       option_list=None,
-                       weights={'is_a' : 1,
-                                'part_of' : 2,
-                                'regulates' : 5},
-                       num_threads=None,
-                       verbose=False):
+    def _lsca_unittest_with_detail(self,
+                                   option_list=None,
+                                   weights=None,
+                                   num_threads=None,
+                                   verbose=False):
+        
+        if not self.save_detail is True or self.obo_detail is {}:
+            raise NotImplementedError, ('Not implemented when save_detail flag'
+                                        + ' is set to False.')
         
         def cbrt(x):
             return math.pow(x, 1.0/3.0)
         
         def _find_lsca(go_1, go_2):
-            r_id, r_dp, r_sc = self.find_lsca(go_1, go_2, weights)
+            r_id, r_dp, r_sc = self.find_lsca_by_detail(go_1, go_2, weights)
             return (r_id, r_dp, r_sc, go_1, go_2)
         
         class print_thread(threading.Thread):
@@ -1007,6 +1311,9 @@ class parse_obo():
             
             def get_results(self):
                 return self.result_dict
+
+        if weights is None:
+            weights = self.weights
 
         thread_messages = multiprocessing.Queue()
         thread_requests = multiprocessing.Queue()
@@ -1142,227 +1449,6 @@ class parse_obo():
             print 'Memory used to store test results: %d bytes.' % asizeof(res)
         
         return res
-
-    def _prepare_file(self, filepath=None):
-        fh = None
-        try:
-            if filepath:
-                fh = open(filepath, 'r')
-            else:
-                try:
-                    fh = open('go.obo', 'r')
-                except:
-                    fh = open('go-basic.obo', 'r')
-        except:
-            try:
-                fh.close()
-            except:
-                pass
-            finally:
-                raise IOError("Cannot locate gene ontology source file.")
-        return fh
-
-    def _parse_file(self, fh):
-        in_file = False
-        in_term = False
-        cur_key = None
-        cur_val = {}
-        
-        # Read the file, line-by-line, and filter the results into
-        #   a dictionary.
-        for line in fh:
-            # All information read prior to the first occurrence of a term
-            #   block is parsed in and recorded as header information. Once
-            #   We encounter our first term block, we consider ourselves to
-            #   have entered the body of the file, and the in_file flag is 
-            #   set to True.
-            if in_file:
-                # We consider ourself to be in the in_term state once we've
-                #   passed the OBO file header. 
-                #   (Once we observe the string '[Term]'.)
-                if in_term:
-                    # When we observe a line with nothing but a newline
-                    #   character, and are inside of a term block, we've
-                    #   finished parsing the term, and can clean the
-                    #   resulting dictionary.
-                    if '\n' == line:
-                        # We're no longer in a term block, so we set the
-                        #   term flag to False.
-                        in_term = False
-                        # If we have synonyms, which appear in the form:
-                        #     '"go_term" RELATION []'
-                        #   we split the string into its parts, and
-                        #   organize according to relation type.
-                        #   As a side note, the go_term in a synonym
-                        #   is encoded as an english phrase, rather than
-                        #   as a unique GO id, and the relation is stored
-                        #   as a completely capitalized string.
-                        if 'synonym' in cur_val:
-                            synonyms = cur_val.pop('synonym')
-                        else:
-                            synonyms = None
-                        if synonyms:
-                            cur_val['synonym'] = {}
-                            for synonym in synonyms:
-                                (plaintext,
-                                 relation_type,
-                                 _) = synonym.rsplit(' ', 2)
-                                cur_val['synonym'].setdefault(
-                                  relation_type.lower(), []).append(plaintext)
-
-                        # If we have relationships, which appear in the form:
-                        #     'relation go_id'
-                        #   we split the string into its parts, and organize
-                        #   according to the relation type. As a note, the
-                        #   linked go_id is the unique GO id.
-                        if 'relationship' in cur_val:
-                            relationships = cur_val.pop('relationship')
-                        else:
-                            relationships = None
-                        if relationships:
-                            for relationship in relationships:
-                                (relation_type,
-                                 go_id) = relationship.rsplit(' ', 1)
-                                cur_val.setdefault(
-                                  relation_type, []).append(go_id)
-
-                        # As a final step, we store the cleaned dictionary.
-                        self.obo_detail[cur_key] = cur_val
-                    # If the line contains anything besides a newline character,
-                    #   then we're currently in a term block.
-                    else:
-                        # Term attributes are stored in the following form:
-                        #     'attribute_type: attribute_value'
-                        #   We split the string into its parts, and store.
-                        try:
-                            k, v = [p.strip() for p in line.split(':', 1)]
-                        except:
-                            print line
-                            raise IOError(('Error encountered in parsing'
-                                           + ' OBO file.'))
-
-                        # Once we've found the id field, we know which go term
-                        #   we're currently reading.
-                        if k == 'id':
-                            cur_key = v
-                        # Occasionally, attributes have extra information:
-                        #     'attribute_type: attribute_value ! information'
-                        #   We remove this information during cleaning.
-                        else:
-                            v = v.split('!')[0].strip()
-                            cur_val.setdefault(k, []).append(v)
-                # If we aren't in a term block, but our line contains
-                #   '[Term]', we know we've entered a term block, and
-                #   set our boolean flags accordingly.
-                elif '[Term]' in line:
-                    in_term = True
-                    cur_key = None
-                    cur_val = {}
-            # If we aren't yet in the body of the file, we parse information
-            #   and record under the assumption that it is part of the file's
-            #   header.
-            else:
-                # This is a bit of a lazy check. In accordance with OBO format,
-                #   we know that each line will contain an attribute key value
-                #   pair. Once this no longer occurs, ergo, once Python fails
-                #   to split a line into two parts around a colon, we know we've
-                #   exited the header block.
-                try:
-                    k, v = [p.strip() for p in line.split(':', 1)]
-                    self.obo_header.setdefault(k, []).append(v)
-                except ValueError:
-                    in_file = True
-                except:
-                    print line
-                    raise IOError("Encountered unexpected line in OBO header.")
-        
-        # As a cursory stage in the final cleaning process for the generated
-        #   obo_detail dictionary, we create new fields 'root' and 'level',
-        #   and generate a set of child terms using the 'is_a' relations from
-        #   each go term. This is then stored under the field name 'contains'.
-        for g_id in self.obo_detail:
-            self.obo_detail[g_id]['root'] = None
-            self.obo_detail[g_id]['level'] = None
-            if 'contains' not in self.obo_detail[g_id]:
-                self.obo_detail[g_id]['contains'] = set()
-            if 'is_a' in self.obo_detail[g_id]:
-                for p_id in self.obo_detail[g_id]['is_a']:
-                    self.obo_detail[p_id].setdefault('contains', 
-                                                     set()).add(g_id)
-            if 'alt_id' in self.obo_detail[g_id]:
-                self.obo_detail[g_id]['alt_id'] = frozenset(
-                                        self.obo_detail[g_id]['alt_id'])
-        
-        # After the set objects in our dictionary are finalized, we cast them
-        #   as frozensets to improve comparison time. We also reduce each list
-        #   with one element to a single element. Typically the reduced fields
-        #   are 'def', 'name', and 'namespace'.
-        for g_id in self.obo_detail:
-            for k, v in self.obo_detail[g_id].items():
-                if isinstance(v, set) or k in self.obo_relations:
-                    v = frozenset(v)
-                elif isinstance(v, list) and len(v) == 1:
-                    v = v[0]
-                self.obo_detail[g_id][k] = v
-        
-        # Lastly, we iterate over the dictionary using depth-first-search,
-        #   starting with each root node. In this way, we set the 'root'
-        #   and 'level' fields of each go term in our dictionary. We note
-        #   that we rely on the 'is_a' relations stored in the 'contains'
-        #   field when constructing our 'root' and 'level' fields; due to
-        #   this, we are ensured not to match multiple roots to the same
-        #   go term. For further information, see:
-        #     http://geneontology.org/page/ontology-structure#oneorthree
-        #   If a term is left without a 'root' and 'level' field following
-        #   this process, it is an obsolete term.
-        for r_id in self.obo_root:
-            visited = set()
-            options = [(r_id, 0)]
-            while options:
-                n_id, n_ht = options.pop(0)
-                if n_id not in visited:
-                    visited.add(n_id)
-                    self.obo_detail[n_id]['root'] = r_id
-                    self.obo_detail[n_id]['level'] = n_ht
-                    options.extend(
-                      [(x, n_ht+1) for x in 
-                        self.obo_detail[n_id]['contains'] - visited]
-                    )
-
-        for g_id in self.obo_detail.keys():
-            if 'alt_id' in self.obo_detail[g_id]:
-                for a_id in self.obo_detail[g_id]['alt_id']:
-                    self.obo_detail[a_id] = self.obo_detail[g_id]
-
-        # As a final step, we perform simple cleaning of our header data.
-        for k, v in self.obo_header.items():
-            if isinstance(v, list) and len(v) == 1:
-                v = v[0]
-            self.obo_header[k] = v
-        
-        if 'date' in self.obo_header:
-            try:
-                self.date = datetime.datetime.strptime(
-                              self.obo_header['date'],
-                              "%d:%m:%Y %H:%M")
-            except:
-                self.date = None
-            
-            if self.date:
-                distance = (datetime.datetime.now() 
-                            - self.date).total_seconds()
-                print (('Parsed GO ontology dump is %0.2f hours old. '
-                        + '(%0.1f days)')
-                       % (distance / 3600, distance / 86400))
-            else:
-                print 'Parsed GO ontology contained no date information. (!)'
-        
-        _bytes = float(asizeof(self))
-        _Mbytes = _bytes / 10**6
-        
-        print (('Memory used to store parse_obo object: %d bytes.'
-                + ' (%0.2f megabytes)')
-               % (_bytes, _Mbytes))
 
 class SimpleSafeJSON(json.JSONEncoder):
     def default(self, obj, safe_method=repr):

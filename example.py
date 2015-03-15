@@ -2124,7 +2124,7 @@ terms = dict([(t.strip('|').split('|')[0].strip(),
                int(t.strip('|').split('|')[1])) for t in terms])
 
 for term in terms:
-    m_id, m_sr = o.find_lsca(term, important)
+    m_id, m_sr = o.find_lsca_by_detail(term, important)
     if m_id:
         matches[term] = {'definition' : {term : o.obo_detail[term]['def'],
                                          m_id : o.obo_detail[m_id]['def']},
