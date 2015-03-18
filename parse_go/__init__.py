@@ -47,10 +47,11 @@ class parse_obo():
         self.obo_header = {}
         self.obo_detail = {}
         self.obo_graph = networkx.DiGraph()
+        self.obo_path = obo_path
         self.save_detail = save_detail
-        obo_handle = self._prepare_file(obo_path)
+        obo_handle = self._prepare_file(self.obo_path)
         try:
-            self._parse_file(obo_handle, save_detail)
+            self._parse_file(obo_handle, self.save_detail)
         except:
             print traceback.format_exc()
             pass
@@ -762,11 +763,18 @@ class parse_obo():
                                  'GO:0016428', 'GO:0030128', 'GO:0045672',
                                  'GO:0034421', 'GO:0070526', 'GO:0001937']
 
-    def reduce_list(self, go_list=[], branch_count=20, range_modifier=0.25):
+    def reduce_list(self, go_list=[], branch_count=20, avoid_roots=False,
+                                      range_modifier=0.25, range_width=1,
+                                      path_lengths=[], dijkstra_lengths=[],
+                                      verbose=0):
+        if verbose > 0:
+            from pprint import pprint
+        
         remaining = set([go_id for go_id in go_list
                          if go_id in self.obo_graph.nodes()])
         result_sets = {}
         flow_counts = {}
+        flow_roots = {}
         branch_optimal = float(len(go_list))/branch_count
         
         for go_id in remaining:
@@ -781,13 +789,33 @@ class parse_obo():
                     found_new = False
             for s in successors:
                 flow_counts.setdefault(s, set()).add(go_id)
+            flow_counts.setdefault(go_id, set()).add(go_id)
         
-        floor = 1
-        ceiling = 1
+        if avoid_roots:
+            for root in self.obo_root:
+                flow_roots[root] = [flow_counts.pop(root)]
+                for alt_root in self.obo_graph.successors(root):
+                    flow_roots[root].append(flow_counts.pop(alt_root))
+        
+        if dijkstra_lengths or path_lengths:
+            for go_id in flow_counts.keys():
+                (_,
+                 dijkstra_length,
+                 path_length) = self.get_root_distance_tuple(go_id)
+                if not (dijkstra_length in dijkstra_lengths
+                        or path_length in path_lengths):
+                    flow_counts.pop(go_id)
+        
+        floor = range_width
+        ceiling = range_width
         stuck = 0
+        iteration = 0
         
-        while len(result_sets) < branch_count:
-            possibilities = [(len(y), self.get_root_distance(x), x)
+        while len(remaining) > 0 or len(flow_counts) < 1:
+            iteration += 1
+            adjust = True
+            possibilities = [(x, len(y), self.get_root_dijkstra(x), 
+                              sum(self.find_lsca(x, _y)[2] for _y in y))
                              for x, y in flow_counts.items()
                              if (len(y) > branch_optimal*(
                                                     floor-range_modifier)
@@ -797,9 +825,20 @@ class parse_obo():
             if possibilities:
                 stuck = 0
                 possibilities = sorted(possibilities,
-                                       key=lambda x : (x[1]*x[0]),
+                                       key=lambda x : (x[1]),
                                        reverse=True)
-                current = possibilities[0][2]
+                current = possibilities[0]
+                if verbose > 1:
+                    print 'Iteration: %d:' % iteration
+                    print (len(remaining), 
+                           self.get_root_distance_tuple(current[0]))
+                    if verbose > 2:
+                        pprint(possibilities)
+                    print ''
+                if current[1] > 1:
+                    current = current[0]
+                else:
+                    break
                 result_sets[current] = flow_counts[current]
                 current = frozenset(flow_counts.pop(current))
                 remaining = remaining - current
@@ -807,7 +846,8 @@ class parse_obo():
                     flow_counts[node] = flow_counts[node] - current
                     if len(flow_counts[node]) < 1:
                         flow_counts.pop(node)
-            else:
+                adjust = False
+            if adjust:
                 if floor < ceiling:
                     floor -= range_modifier
                 else:
@@ -818,13 +858,23 @@ class parse_obo():
                 else:
                     stuck += 1
         
-        from pprint import pprint
-        pprint([(r,
-                 self.get_root_distance(r),
-                 len(result_sets[r]),
-                 self.obo_detail[r]['name'] if self.save_detail else '') 
-                for r in result_sets])
-        print len(remaining)
+        if verbose > 0:
+            print 'Reduction list contains %d terms.' % len(result_sets)
+            pprint(sorted([(r,
+                            self.get_root_distance_tuple(r),
+                            len(result_sets[r]),
+                            self.obo_detail[r]['name'] if self.save_detail
+                                                       else '')
+                           for r in result_sets],
+                          key=lambda x : x[2],
+                          reverse=True))
+            if verbose > 3:
+                print 'Unable to reduce %d terms.' % len(remaining)
+                pprint([(r,
+                         self.get_root_distance_tuple(r),
+                         self.obo_detail[r]['name'] if self.save_detail
+                                                    else '')
+                       for r in remaining])
         
         return result_sets
     
@@ -856,15 +906,16 @@ class parse_obo():
                                  if networkx.has_path(self.obo_graph,
                                                       go, shared_root)
                                  else float('inf'),
-                                 neighbor_set_1[go]**2 + neighbor_set_2[go]**2)
+                                 float(neighbor_set_1[go]**2 
+                                       + neighbor_set_2[go]**2))
                                 for go in combined_set]
                 combined_set = sorted(combined_set,
                                       key=lambda x : (x[1], -x[2]),
                                       reverse=True)
                 return combined_set[0]
             elif len(combined_set) > 0:
-                return (shared_root, 0, (neighbor_set_1[shared_root]**2
-                                         + neighbor_set_2[shared_root]**2))
+                return (shared_root, 0, float(neighbor_set_1[shared_root]**2
+                                              + neighbor_set_2[shared_root]**2))
             else:
                 raise ValueError, ('It has been shown that both %s and %s share'
                                    + ' a root at %s. As such, the intersection'
@@ -876,20 +927,40 @@ class parse_obo():
     def get_root(self, go_id):
         return self.get_root_distance_tuple(go_id)[0]
 
-    def get_root_distance(self, go_id):
+    def get_root_dijkstra(self, go_id):
         return self.get_root_distance_tuple(go_id)[1]
+    
+    def get_root_distance(self, go_id):
+        return self.get_root_distance_tuple(go_id)[2]
 
     def get_root_distance_tuple(self, go_id):
-        term_root = None
-        scored_root = float('inf')
-        for root in self.obo_root:
-            if networkx.has_path(self.obo_graph, go_id, root):
-                scored_temp = networkx.shortest_path_length(self.obo_graph,
-                                                            go_id, root)
-                if scored_temp < scored_root:
-                    term_root = root
-                    scored_root = scored_temp
-        return term_root, scored_root
+        root = None
+        root_dijkstra = float('inf')
+        root_distance = float('inf')
+        for r_id in self.obo_root:
+            if networkx.has_path(self.obo_graph, go_id, r_id):
+                temp_dijkstra = networkx.dijkstra_path_length(self.obo_graph,
+                                                              go_id, r_id)
+                if temp_dijkstra < root_dijkstra:
+                    root = r_id
+                    root_dijkstra = temp_dijkstra
+                    root_distance = networkx.shortest_path_length(self.obo_graph,
+                                                                  go_id, r_id)
+        return root, root_dijkstra, root_distance
+
+    def generate_detail(self):
+        self.obo_header = {}
+        self.obo_detail = {}
+        self.obo_graph = networkx.DiGraph()
+        self.save_detail = True
+        obo_handle = self._prepare_file(self.obo_path)
+        try:
+            self._parse_file(obo_handle, self.save_detail)
+        except:
+            print traceback.format_exc()
+            pass
+        finally:
+            obo_handle.close()
 
     def _prepare_file(self, filepath=None):
         fh = None
@@ -907,7 +978,7 @@ class parse_obo():
             except:
                 pass
             finally:
-                raise IOError("Cannot locate gene ontology source file.")
+                raise IOError, 'Cannot locate gene ontology source file.'
         return fh
 
     def _parse_file(self, fh, save_detail=None):
@@ -983,8 +1054,10 @@ class parse_obo():
                         
                         if 'alt_id' in cur_val:
                             for go_id in cur_val['alt_id']:
-                                self.obo_graph.add_cycle([cur_key, go_id],
-                                                         weight=0)
+                                self.obo_graph.add_edge(cur_key, go_id,
+                                                        weight=0)
+                                self.obo_graph.add_edge(go_id, cur_key,
+                                                        weight=0)
                                 modifiable.append(go_id)
                         
                         for go_src in modifiable:
@@ -1044,8 +1117,9 @@ class parse_obo():
                 except ValueError:
                     in_file = True
                 except:
-                    print line
-                    raise IOError("Encountered unexpected line in OBO header.")
+                    print traceback.format_exc()
+                    raise IOError, ('Encountered unexpected line in OBO header.'
+                                    + ' on line:\n%s.') % line
         
         if save_detail is True:
             # As a cursory stage in the final cleaning process for the generated
@@ -1136,6 +1210,114 @@ class parse_obo():
         print (('Memory used to store parse_obo object: %d bytes.'
                 + ' (%0.2f megabytes)')
                % (byte_count, Mbyte_count))
+
+    def _generate_test_csv(self):
+        _15_default = self.reduce_list(self.__uncc_test_list,
+                                       branch_count=15)
+        _1 = {}
+        for k, v in _15_default.items():
+            for _v in v:
+                _1[_v] = k
+        _30_default = self.reduce_list(self.__uncc_test_list,
+                                       branch_count=30)
+        _2 = {}
+        for k, v in _30_default.items():
+            for _v in v:
+                _2[_v] = k
+        _45_default = self.reduce_list(self.__uncc_test_list,
+                                       branch_count=45)
+        _3 = {}
+        for k, v in _45_default.items():
+            for _v in v:
+                _3[_v] = k
+        _60_default = self.reduce_list(self.__uncc_test_list,
+                                       branch_count=60)
+        _4 = {}
+        for k, v in _60_default.items():
+            for _v in v:
+                _4[_v] = k
+        
+        _15_avoid = self.reduce_list(self.__uncc_test_list,
+                                     branch_count=15,
+                                     avoid_roots=True)
+        _5 = {}
+        for k, v in _15_avoid.items():
+            for _v in v:
+                _5[_v] = k
+        _30_avoid = self.reduce_list(self.__uncc_test_list,
+                                     branch_count=30,
+                                     avoid_roots=True)
+        _6 = {}
+        for k, v in _30_avoid.items():
+            for _v in v:
+                _6[_v] = k
+        _45_avoid = self.reduce_list(self.__uncc_test_list,
+                                     branch_count=45,
+                                     avoid_roots=True)
+        _7 = {}
+        for k, v in _45_avoid.items():
+            for _v in v:
+                _7[_v] = k
+        _60_avoid = self.reduce_list(self.__uncc_test_list,
+                                     branch_count=60,
+                                     avoid_roots=True)
+        _8 = {}
+        for k, v in _60_avoid.items():
+            for _v in v:
+                _8[_v] = k
+        
+        _15_2range = self.reduce_list(self.__uncc_test_list,
+                                      branch_count=15,
+                                      range_width=2,
+                                      avoid_roots=True,
+                                      path_lengths=[1])
+        _9 = {}
+        for k, v in _15_2range.items():
+            for _v in v:
+                _9[_v] = k
+        _30_2range = self.reduce_list(self.__uncc_test_list,
+                                      branch_count=30,
+                                      range_width=2,
+                                      avoid_roots=True,
+                                      path_lengths=[1,2])
+        _10 = {}
+        for k, v in _30_2range.items():
+            for _v in v:
+                _10[_v] = k
+        _45_2range = self.reduce_list(self.__uncc_test_list,
+                                      branch_count=45,
+                                      range_width=2,
+                                      dijkstra_lengths=[1,2,3])
+        _11 = {}
+        for k, v in _45_2range.items():
+            for _v in v:
+                _11[_v] = k
+        _45_3range = self.reduce_list(self.__uncc_test_list,
+                                      branch_count=45,
+                                      range_width=3,
+                                      dijkstra_lengths=[1,2,3])
+        _12 = {}
+        for k, v in _45_3range.items():
+            for _v in v:
+                _12[_v] = k
+        
+        with open('uncc_test_go_mapping.csv', 'w') as fh:
+            fh.write('go_term,15_default,30_default,45_default,60_default'
+                     + '15_avoid_roots=True,30_avoid_roots=True,'
+                     + '45_avoid_roots=True,60_avoid_roots=True,'
+                     + '15_range_width=2|avoid_roots=True|path_lengths=[1],'
+                     + '30_range_width=2|avoid_roots=True|path_lenghts=[1|2],'
+                     + '45_range_width=2|dijkstra_lengths=[1|2|3],'
+                     + '45_range_width=3|dijkstra_lengths=[1|2|3]\n')
+            for go_term in sorted(self.obo_graph.nodes()):
+                fh.write(go_term)
+                for map in [_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12]:
+                    fh.write(',')
+                    if go_term in map:
+                        fh.write(map[go_term])
+                    else:
+                        fh.write(go_term)
+                fh.write('\n')
 
     ### METHODS PAST THIS POINT REQUIRE OBO_DETAIL IN ORDER TO RUN ###
 
