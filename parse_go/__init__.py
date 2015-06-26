@@ -1,55 +1,64 @@
 ###
 # AUTHORS: CHRISTIAN GIBSON, 
-# PROJECT: PARSE GO
-# UPDATED: MARCH 15, 2015
+# PROJECT: GO VIZUALIZATION
+# UPDATED: MAY 10, 2015
 # USAGE:   from parse_go import parse_obo ; go = parse_obo()
 # EXPECTS: python 2.7.6
 #          networkx 1.9.1
 ###
 
 from pympler.asizeof import asizeof
-import multiprocessing
-import collections
-import threading
-import traceback
-import itertools
-import datetime
-import networkx
-import ctypes
-import psutil
 import Queue
-import time
+import collections
+import ctypes
+import datetime
+import itertools
 import json
 import math
+import multiprocessing
+import networkx
+import psutil
+import shutil
 import sys
+import threading
+import time
+import traceback
+import urllib
 
-class parse_obo():
+
+_DEFAULT_OBO_RELATIONS = ['is_a', 'part_of', 'regulates',
+                          'negatively_regulates', 'positively_regulates',
+                          'has_part', 'occurs_in', 'happens_during']
+_DEFAULT_GO_OBO_SOURCE = 'http://geneontology.org/ontology/go.obo'
+_DEFAULT_GO_OWL_SOURCE = 'http://purl.obolibrary.org/obo/go.owl'
+_DEFAULT_GO_CROSS_SOURCE = 'http://purl.obolibrary.org/obo/go/extensions/go-plus.owl'
+
+class parse_obo(object):
     def __init__(self, weights={'is_a' : 1, 'part_of' : 2, 'regulates' : 5},
-                       obo_root=['GO:0003674', 'GO:0005575', 'GO:0008150'],
-                       obo_relations=['is_a', 'part_of', 'regulates'],
-                       obo_disjoint=['is_a'],
-                       obo_path=None,
-                       save_detail=False):
+                       roots=['GO:0003674', 'GO:0005575', 'GO:0008150'],
+                       relations=_DEFAULT_OBO_RELATIONS,
+                       disjoint=['is_a'],
+                       source_path=None,
+                       save_detail=False,
+                       verbose=True):
         # Note: the algorithms herein assume that those terms in
-        #   self.obo_root are root nodes for the entire go graph,
-        #   and that the relations listed in self.obo_relations
-        #   are used to traverse the go ontology. self.obo_disjoint
+        #   self.roots are root nodes for the entire go graph,
+        #   and that the relations listed in self.relations
+        #   are used to traverse the go ontology. self.disjoint
         #   contains those relations that separate the go ontology
         #   into disjoint ontologies that link to a single root.
-        #   It should be a proper subset of self.obo_relations.
-        self.weights = weights
-        self.obo_root = obo_root
-        self.obo_relations = frozenset(obo_relations)
-        self.obo_disjoint = []
-        for d in obo_disjoint:
-            if d in self.obo_relations:
-                self.obo_disjoint.append(d)
+        #   As such, it should be a proper subset of self.relations.
+        self.weights = {k : v for k, v in weights.items()}
+        self.roots = roots
+        self.relations = frozenset([o for o in relations if o in weights])
+        self.disjoint = frozenset([o for o in disjoint if o in self.relations])
         self.obo_header = {}
         self.obo_detail = {}
-        self.obo_graph = networkx.DiGraph()
-        self.obo_path = obo_path
+        self.graph = networkx.DiGraph()
+        self.source_path = source_path
         self.save_detail = save_detail
-        obo_handle = self._prepare_file(self.obo_path)
+        self.verbose = verbose
+        obo_handle = self._prepare_file(self.source_path)
         try:
             self._parse_file(obo_handle, self.save_detail)
         except:
@@ -762,46 +771,68 @@ class parse_obo():
                                  'GO:0007156', 'GO:0008080', 'GO:0016429',
                                  'GO:0016428', 'GO:0030128', 'GO:0045672',
                                  'GO:0034421', 'GO:0070526', 'GO:0001937']
+        self.__uncc_test_dict = {}
+        try:
+            with open('goterms.json', 'r') as fh:
+                self.__uncc_test_dict = json.load(fh)
+        except:
+            pass
 
-    def reduce_list(self, go_list=[], branch_count=20, avoid_roots=False,
-                                      range_modifier=0.25, range_width=1,
-                                      path_lengths=[], dijkstra_lengths=[],
-                                      verbose=0):
+    def reduce_dict(self, go_terms={}, branch_count=20, avoid_roots=False,
+                                       range_modifier=0.25, range_width=1,
+                                       path_lengths=[], dijkstra_lengths=[],
+                                       verbose=0):
+        if isinstance(go_terms, dict):
+            for k in go_terms:
+                go_terms[k] = self.reduce_dict(go_terms[k],
+                                               branch_count=branch_count,
+                                               avoid_roots=avoid_roots,
+                                               range_modifier=range_modifier,
+                                               range_width=range_width,
+                                               path_lengths=path_lengths,
+                                               dijkstra_lengths=dijkstra_lengths,
+                                               verbose=verbose)
+        elif isinstance(go_terms, list):
+            return self.reduce_list(go_terms,
+                                    branch_count=branch_count,
+                                    avoid_roots=avoid_roots,
+                                    range_modifier=range_modifier,
+                                    range_width=range_width,
+                                    path_lengths=path_lengths,
+                                    dijkstra_lengths=dijkstra_lengths,
+                                    verbose=verbose)
+        else:
+            raise TypeError
+
+    def reduce_list(self, go_terms=[], branch_count=20, avoid_roots=False,
+                                       range_modifier=0.25, range_width=1,
+                                       path_lengths=[], dijkstra_lengths=[],
+                                       verbose=0):
+        if self.verbose:
+            verbose = max(1, verbose)
         if verbose > 0:
             from pprint import pprint
         
-        remaining = set([go_id for go_id in go_list
-                         if go_id in self.obo_graph.nodes()])
-        result_sets = {}
-        flow_counts = {}
-        flow_roots = {}
-        branch_optimal = float(len(go_list))/branch_count
+        remaining = set([go_id for go_id in go_terms
+                         if go_id in self.graph.nodes()])
         
-        for go_id in remaining:
-            successors = set(self.obo_graph.successors(go_id))
-            found_new = True
-            while found_new:
-                next_round = set(sum([self.obo_graph.successors(s)
-                                      for s in successors], []))
-                if len(next_round.union(successors)) > len(successors):
-                    successors = next_round.union(successors)
-                else:
-                    found_new = False
-            for s in successors:
-                flow_counts.setdefault(s, set()).add(go_id)
-            flow_counts.setdefault(go_id, set()).add(go_id)
+        flow_counts = self._generate_flow_count(remaining, branch_count)
+        
+        result_sets = {}
+        flow_roots = {}
+        branch_optimal = float(len(go_terms)) / branch_count
         
         if avoid_roots:
-            for root in self.obo_root:
+            for root in self.roots:
                 flow_roots[root] = [flow_counts.pop(root)]
-                for alt_root in self.obo_graph.successors(root):
+                for alt_root in self.graph.successors(root):
                     flow_roots[root].append(flow_counts.pop(alt_root))
         
         if dijkstra_lengths or path_lengths:
             for go_id in flow_counts.keys():
                 (_,
                  dijkstra_length,
-                 path_length) = self.get_root_distance_tuple(go_id)
+                 path_length) = self._get_root_distance_tuple(go_id)
                 if not (dijkstra_length in dijkstra_lengths
                         or path_length in path_lengths):
                     flow_counts.pop(go_id)
@@ -814,13 +845,12 @@ class parse_obo():
         while len(remaining) > 0 or len(flow_counts) < 1:
             iteration += 1
             adjust = True
-            possibilities = [(x, len(y), self.get_root_dijkstra(x), 
+            possibilities = [(x, len(y), self._get_root_dijkstra(x),
                               sum(self.find_lsca(x, _y)[2] for _y in y))
                              for x, y in flow_counts.items()
-                             if (len(y) > branch_optimal*(
-                                                    floor-range_modifier)
-                                 and len(y) < branch_optimal*(
-                                                    ceiling+range_modifier)
+                             if (len(y) > branch_optimal * (floor - range_modifier)
+                                 and len(y) < branch_optimal * (
+                                                    ceiling + range_modifier)
                             )]
             if possibilities:
                 stuck = 0
@@ -830,8 +860,8 @@ class parse_obo():
                 current = possibilities[0]
                 if verbose > 1:
                     print 'Iteration: %d:' % iteration
-                    print (len(remaining), 
-                           self.get_root_distance_tuple(current[0]))
+                    print (len(remaining),
+                           self._get_root_distance_tuple(current[0]))
                     if verbose > 2:
                         pprint(possibilities)
                     print ''
@@ -861,7 +891,7 @@ class parse_obo():
         if verbose > 0:
             print 'Reduction list contains %d terms.' % len(result_sets)
             pprint(sorted([(r,
-                            self.get_root_distance_tuple(r),
+                            self._get_root_distance_tuple(r),
                             len(result_sets[r]),
                             self.obo_detail[r]['name'] if self.save_detail
                                                        else '')
@@ -871,51 +901,69 @@ class parse_obo():
             if verbose > 3:
                 print 'Unable to reduce %d terms.' % len(remaining)
                 pprint([(r,
-                         self.get_root_distance_tuple(r),
+                         self._get_root_distance_tuple(r),
                          self.obo_detail[r]['name'] if self.save_detail
                                                     else '')
                        for r in remaining])
         
         return result_sets
     
+    def _generate_flow_count(self, go_list, branch_count=20):
+        flow_path = {}
+        for go_id in go_list:
+            successors = set(self.graph.successors(go_id))
+            found_new = True
+            while found_new:
+                next_round = set(sum([self.graph.successors(s)
+                                      for s in successors], []))
+                if len(next_round.union(successors)) > len(successors):
+                    successors = next_round.union(successors)
+                else:
+                    found_new = False
+            for s in successors:
+                flow_path.setdefault(s, set()).add(go_id)
+            flow_path.setdefault(go_id, set()).add(go_id)
+        
+        return flow_path
+    
     def find_lsca(self, go_1, go_2):
         shared_root = None
         scored_root = float('inf')
-        for root in self.obo_root:
-            if (networkx.has_path(self.obo_graph, go_1, root)
-                and networkx.has_path(self.obo_graph, go_2, root)):
-                scored_temp = networkx.shortest_path_length(self.obo_graph,
-                                                            go_1, root)**2
-                scored_temp+= networkx.shortest_path_length(self.obo_graph,
-                                                            go_2, root)**2
+        for root in self.roots:
+            if (networkx.has_path(self.graph, go_1, root)
+                and networkx.has_path(self.graph, go_2, root)):
+                scored_temp = networkx.shortest_path_length(self.graph,
+                                                            go_1, root) ** 2
+                scored_temp += networkx.shortest_path_length(self.graph,
+                                                            go_2, root) ** 2
                 if scored_temp < scored_root:
                     shared_root = root
                     scored_root = scored_temp
         if shared_root:
             neighbor_set_1 = networkx.single_source_dijkstra_path_length(
-                                         self.obo_graph, go_1)
+                                         self.graph, go_1)
             neighbor_set_2 = networkx.single_source_dijkstra_path_length(
-                                         self.obo_graph, go_2)
+                                         self.graph, go_2)
             combined_set = set(neighbor_set_1.keys()).intersection(
                                          set(neighbor_set_2.keys()))
             if len(combined_set) > 1:
-                combined_set = [(go, 
-                                 networkx.shortest_path_length(self.obo_graph,
+                combined_set = [(go,
+                                 networkx.shortest_path_length(self.graph,
                                                                go,
                                                                shared_root)
-                                 if networkx.has_path(self.obo_graph,
+                                 if networkx.has_path(self.graph,
                                                       go, shared_root)
                                  else float('inf'),
-                                 float(neighbor_set_1[go]**2 
-                                       + neighbor_set_2[go]**2))
+                                 float(neighbor_set_1[go] ** 2
+                                       + neighbor_set_2[go] ** 2))
                                 for go in combined_set]
                 combined_set = sorted(combined_set,
                                       key=lambda x : (x[1], -x[2]),
                                       reverse=True)
                 return combined_set[0]
             elif len(combined_set) > 0:
-                return (shared_root, 0, float(neighbor_set_1[shared_root]**2
-                                              + neighbor_set_2[shared_root]**2))
+                return (shared_root, 0, float(neighbor_set_1[shared_root] ** 2
+                                              + neighbor_set_2[shared_root] ** 2))
             else:
                 raise ValueError, ('It has been shown that both %s and %s share'
                                    + ' a root at %s. As such, the intersection'
@@ -924,36 +972,161 @@ class parse_obo():
         else:
             return (None, float('inf'), float('inf'))
 
-    def get_root(self, go_id):
-        return self.get_root_distance_tuple(go_id)[0]
+    def _get_root(self, go_id):
+        return self._get_root_distance_tuple(go_id)[0]
 
-    def get_root_dijkstra(self, go_id):
-        return self.get_root_distance_tuple(go_id)[1]
+    def _get_root_dijkstra(self, go_id):
+        return self._get_root_distance_tuple(go_id)[1]
     
-    def get_root_distance(self, go_id):
-        return self.get_root_distance_tuple(go_id)[2]
+    def _get_root_distance(self, go_id):
+        return self._get_root_distance_tuple(go_id)[2]
 
-    def get_root_distance_tuple(self, go_id):
+    def _get_root_distance_tuple(self, go_id):
         root = None
         root_dijkstra = float('inf')
         root_distance = float('inf')
-        for r_id in self.obo_root:
-            if networkx.has_path(self.obo_graph, go_id, r_id):
-                temp_dijkstra = networkx.dijkstra_path_length(self.obo_graph,
+        for r_id in self.roots:
+            if networkx.has_path(self.graph, go_id, r_id):
+                temp_dijkstra = networkx.dijkstra_path_length(self.graph,
                                                               go_id, r_id)
                 if temp_dijkstra < root_dijkstra:
                     root = r_id
                     root_dijkstra = temp_dijkstra
-                    root_distance = networkx.shortest_path_length(self.obo_graph,
+                    root_distance = networkx.shortest_path_length(self.graph,
                                                                   go_id, r_id)
         return root, root_dijkstra, root_distance
+
+    def generate_circle_representation(self, size=960, verbose=True):
+        disjoint_representation = parse_obo(weights={r : 1
+                                                     for r in self.disjoint},
+                                            save_detail=True,
+                                            verbose=False)
+        disjoint_representation._generate_node_complexity()
+        disjoint_levels = {r : collections.defaultdict(int)
+                           for r in self.roots}
+        disjoint_trees = {r : {}
+                          for r in self.roots}
+        disjoint_display = {r : {}
+                            for r in self.roots}
+        level_counts = {r : {}
+                        for r in self.roots + ['GO:0000000']}
+        
+        for g_id in disjoint_representation.graph:
+            if disjoint_representation.obo_detail[g_id]['root']:
+                disjoint_levels[disjoint_representation.obo_detail[g_id]['root']
+                                ].setdefault(
+                    disjoint_representation.obo_detail[g_id]['complexity'],
+                    []).append((g_id,
+                     [c_id
+                      for c_id, dist in disjoint_representation.graph[
+                                            g_id].items()
+                      if 'weight' in dist and dist['weight'] == 1]))
+        
+        for r_id in disjoint_levels:
+            disjoint_levels[r_id] = dict(disjoint_levels[r_id])
+            for l in range(len(disjoint_levels[r_id]) - 1, -1, -1):
+                level_counts['GO:0000000'].setdefault(l, 0)
+                level_counts[r_id][l] = 0
+                for g_id, p_ids in disjoint_levels[r_id][l]:
+                    level_counts[r_id][l] += 1
+                    if len(p_ids) == 1:
+                        if g_id in disjoint_trees[r_id]:
+                            disjoint_trees[r_id].setdefault(p_ids[0], {})[
+                                g_id] = disjoint_trees[r_id].pop(g_id)
+                        else:
+                            disjoint_trees[r_id].setdefault(p_ids[0], {})[
+                                g_id] = None
+                level_counts['GO:0000000'][l] += level_counts[r_id][l]
+        
+        for r_id in disjoint_levels:
+            for g_id in disjoint_trees[r_id]:
+                disjoint_display[r_id].setdefault(
+                    disjoint_representation.graph.node[g_id]['complexity'],
+                    {})[g_id] = disjoint_trees[r_id][g_id]
+        
+        origin = [size / 2.0, ] * 2
+        
+        def translate(point, centroid=[0, 0], angle=0):
+            angle = (360 - angle) % ((-1 if angle < 0 else 1) * 360)
+            angle = angle * math.pi / 180
+            res = [point[0] - centroid[0], point[1] - centroid[1]]
+            res = [res[0] * math.cos(angle) - res[1] * math.sin(angle),
+                   res[0] * math.sin(angle) + res[1] * math.cos(angle)]
+            return [res[0] + centroid[0], res[1] + centroid[1]]
+        
+        def semicircle(nodes, centroid, angle, radius=3):
+            p = {}
+            for n_idx in range(len(nodes)):
+                p[nodes[n_idx]] = [(n_idx - len(nodes) / 2) * radius + centroid[1],
+                                    (0.05 * (abs(n_idx - len(nodes) / 2) * radius
+                                             + centroid[0]) ** 2 + centroid[1])]
+                p[nodes[n_idx]] = translate(p[nodes[n_idx]], centroid, angle)
+            return p
+        
+        if verbose:
+            print 'Gene Ontology Summary:'
+            for r_id in disjoint_levels:
+                print '  ', r_id,
+                print '\tLevels:', len(disjoint_levels[r_id]),
+                print '\tNodes:', sum([len(disjoint_levels[r_id][l])
+                                       for l in disjoint_levels[r_id]]),
+                print '\tReduct:', len(disjoint_trees[r_id]),
+                print '\tSingle Path Nodes:',
+                print sum([len([True for _, c in disjoint_levels[r_id][l]
+                                     if len(c) == 1])
+                           for l in disjoint_levels[r_id]])
+                for l in disjoint_levels[r_id]:
+                    print ' ' * (len(r_id) + 2),
+                    print '\tLevel #' + str(l),
+                    print '\tNodes:',
+                    print level_counts[r_id][l],
+                    print '\tReduct:',
+                    print (len(disjoint_display[r_id][l])
+                           if l in disjoint_display[r_id] else 0),
+                    print '\tLevel Percentage :',
+                    print "{0:.2%}".format(
+                          (float(level_counts[r_id][l])
+                           / float(level_counts['GO:0000000'][l])))
+        
+        return disjoint_representation, disjoint_display, level_counts
+    
+    def _generate_node_complexity(self):
+        inverse_weights = {k:-1 for k in self.weights}
+        inverse_self = parse_obo(weights=inverse_weights,
+                                 roots=self.roots,
+                                 relations=self.relations,
+                                 disjoint=self.disjoint,
+                                 source_path=self.source_path,
+                                 save_detail=True,
+                                 verbose=False)
+        inverse_graph = inverse_self.graph.reverse(copy=False)
+        count = 0
+        for r_id in self.roots:
+            fprint(s='Calculating node complexity... %d remain.\t\t',
+                   f=(len(self.graph.node) - count))
+            for g_id, val in networkx.bellman_ford(inverse_graph, r_id)[1].iteritems():
+                if r_id is inverse_self.obo_detail[g_id]['root']:
+                    self.graph.node[g_id]['complexity'] = -val
+                    count += 1
+        fprint(s='Calculating node complexity... %d remain.\t\t\n',
+               f=(len(self.graph.node) - count))
+        if len(self.graph.node) - count > 0:
+            assert([('is_obsolete' in inverse_self.obo_detail[g_id]
+                     and inverse_self.obo_detail[g_id]['is_obsolete'])
+                    or ('complexity' in self.graph.node[g_id]
+                        and (self.graph.node[g_id]['complexity'] != 
+                               inverse_self.obo_detail[g_id]['level'])
+                        or inverse_self.obo_detail[g_id]['level'] == 0)
+                    for g_id in inverse_self.obo_detail])
+        self.obo_detail = self.graph.node
+        return inverse_graph
 
     def generate_detail(self):
         self.obo_header = {}
         self.obo_detail = {}
-        self.obo_graph = networkx.DiGraph()
+        self.graph = networkx.DiGraph()
         self.save_detail = True
-        obo_handle = self._prepare_file(self.obo_path)
+        obo_handle = self._prepare_file(self.source_path)
         try:
             self._parse_file(obo_handle, self.save_detail)
         except:
@@ -961,6 +1134,14 @@ class parse_obo():
             pass
         finally:
             obo_handle.close()
+
+    def fetch_update(self, url=None, filepath=None):
+        try:
+            urllib.urlretrieve(url=url if url else _DEFAULT_GO_OBO_SOURCE,
+                               filename=filepath if filepath else 'go.obo')
+            return True
+        except:
+            print traceback.format_exc()
 
     def _prepare_file(self, filepath=None):
         fh = None
@@ -978,7 +1159,20 @@ class parse_obo():
             except:
                 pass
             finally:
-                raise IOError, 'Cannot locate gene ontology source file.'
+                print 'Cannot locate gene ontology source file.'
+                print 'Attempting to download source file now.'
+                filename = 'go_%s.obo' % time.strftime('%m%d%Y')
+                try:
+                    self.fetch_update(filepath=filename)
+                    print 'Source file downloaded. Saved as %s.' % filename
+                except:
+                    raise IOError, 'Failed to download gene ontology source file.'
+                try:
+                    shutil.copyfile(filename, 'go.obo')
+                    print 'Copy saved as go.obo for future use.'
+                except:
+                    raise IOError, 'Failed to backup gene ontology source file.'
+                return self._prepare_file(filepath=filename)
         return fh
 
     def _parse_file(self, fh, save_detail=None):
@@ -1050,26 +1244,17 @@ class parse_obo():
                                 cur_val.setdefault(
                                   relation_type, []).append(go_id)
                         
-                        modifiable = [cur_key] 
-                        
-                        if 'alt_id' in cur_val:
-                            for go_id in cur_val['alt_id']:
-                                self.obo_graph.add_edge(cur_key, go_id,
-                                                        weight=0)
-                                self.obo_graph.add_edge(go_id, cur_key,
-                                                        weight=0)
-                                modifiable.append(go_id)
-                        
-                        for go_src in modifiable:
-                            for relation in self.obo_relations:
-                                if relation in cur_val:
-                                    for go_id in cur_val[relation]:
-                                        self.obo_graph.add_edge(
-                                                  go_src, go_id,
-                                                  weight=self.weights[relation])
+                        for relation in self.relations:
+                            if relation in cur_val:
+                                for go_id in cur_val[relation]:
+                                    self.graph.add_edge(
+                                              cur_key, go_id,
+                                              weight=self.weights[relation])
 
-                        # As a final step, we store the cleaned dictionary.
-                        if save_detail:
+                        # As a final step, we store the cleaned dictionary. If
+                        #   the user has requested we store associated data
+                        #   concerning GO ids.
+                        if self.save_detail:
                             self.obo_detail[cur_key] = cur_val
                     # If the line contains anything besides a newline character,
                     #   then we're currently in a term block.
@@ -1088,7 +1273,7 @@ class parse_obo():
                         #   we're currently reading.
                         if k == 'id':
                             cur_key = v
-                            self.obo_graph.add_node(v)
+                            self.graph.add_node(v)
                         # Occasionally, attributes have extra information:
                         #     'attribute_type: attribute_value ! information'
                         #   We remove this information during cleaning.
@@ -1121,10 +1306,10 @@ class parse_obo():
                     raise IOError, ('Encountered unexpected line in OBO header.'
                                     + ' on line:\n%s.') % line
         
-        if save_detail is True:
+        if self.save_detail:
             # As a cursory stage in the final cleaning process for the generated
-            #   obo_detail dictionary, we create new fields 'root' and 'level',
-            #   and generate a set of child terms using the 'is_a' relations
+            #   obo_detail dictionary, we create new fields 'root', and 'level'
+            #   and generate a set of child terms using the 'is_a' relations 
             #   from each go term. This is then stored under the field name
             #   'contains'.
             for g_id in self.obo_detail:
@@ -1134,11 +1319,12 @@ class parse_obo():
                     self.obo_detail[g_id]['contains'] = set()
                 if 'is_a' in self.obo_detail[g_id]:
                     for p_id in self.obo_detail[g_id]['is_a']:
-                        self.obo_detail[p_id].setdefault('contains', 
+                        self.obo_detail[p_id].setdefault('contains',
                                                          set()).add(g_id)
                 if 'alt_id' in self.obo_detail[g_id]:
-                    self.obo_detail[g_id]['alt_id'] = frozenset(
-                                            self.obo_detail[g_id]['alt_id'])
+                    self.obo_detail[g_id]['alt_id'] = frozenset(a_id
+                                    for a_id in self.obo_detail[g_id]['alt_id']
+                                    if a_id in self.obo_detail)
             
             # After the set objects in our dictionary are finalized, we cast
             #   them as frozensets to improve comparison time. We also reduce
@@ -1146,9 +1332,10 @@ class parse_obo():
             #   reduced fields are 'def', 'name', and 'namespace'.
             for g_id in self.obo_detail:
                 for k, v in self.obo_detail[g_id].items():
-                    if isinstance(v, set) or k in self.obo_relations:
+                    if isinstance(v, set) or k in self.relations:
                         v = frozenset(v)
-                    elif isinstance(v, list) and len(v) == 1:
+                    elif (isinstance(v, list) and len(v) == 1
+                          and k not in _DEFAULT_OBO_RELATIONS):
                         v = v[0]
                     self.obo_detail[g_id][k] = v
             
@@ -1162,7 +1349,7 @@ class parse_obo():
             #     http://geneontology.org/page/ontology-structure#oneorthree
             #   If a term is left without a 'root' and 'level' field following
             #   this process, it is an obsolete term.
-            for r_id in self.obo_root:
+            for r_id in self.roots:
                 visited = set()
                 options = [(r_id, 0)]
                 while options:
@@ -1172,14 +1359,11 @@ class parse_obo():
                         self.obo_detail[n_id]['root'] = r_id
                         self.obo_detail[n_id]['level'] = n_ht
                         options.extend(
-                          [(x, n_ht+1) for x in 
+                          [(x, n_ht + 1) for x in 
                             self.obo_detail[n_id]['contains'] - visited]
                         )
-    
-            for g_id in self.obo_detail.keys():
-                if 'alt_id' in self.obo_detail[g_id]:
-                    for a_id in self.obo_detail[g_id]['alt_id']:
-                        self.obo_detail[a_id] = self.obo_detail[g_id]
+            
+            self.graph.node.update(self.obo_detail)
 
         # As a final step, we perform simple cleaning of our header data.
         for k, v in self.obo_header.items():
@@ -1196,132 +1380,27 @@ class parse_obo():
                 self.date = None
             
             if self.date:
-                distance = (datetime.datetime.now() 
-                            - self.date).total_seconds()
-                print (('Parsed GO ontology dump is %0.2f hours old. '
-                        + '(%0.1f days)')
-                       % (distance / 3600, distance / 86400))
+                if self.verbose:
+                    distance = (datetime.datetime.now() 
+                                - self.date).total_seconds()
+                    print (('Parsed GO ontology dump is %0.2f hours old. '
+                            + '(%0.1f days)')
+                           % (distance / 3600, distance / 86400))
             else:
                 print 'Parsed GO ontology contained no date information. (!)'
         
-        byte_count = float(asizeof(self))
-        Mbyte_count = byte_count / 10**6
-        
-        print (('Memory used to store parse_obo object: %d bytes.'
-                + ' (%0.2f megabytes)')
-               % (byte_count, Mbyte_count))
-
-    def _generate_test_csv(self):
-        _15_default = self.reduce_list(self.__uncc_test_list,
-                                       branch_count=15)
-        _1 = {}
-        for k, v in _15_default.items():
-            for _v in v:
-                _1[_v] = k
-        _30_default = self.reduce_list(self.__uncc_test_list,
-                                       branch_count=30)
-        _2 = {}
-        for k, v in _30_default.items():
-            for _v in v:
-                _2[_v] = k
-        _45_default = self.reduce_list(self.__uncc_test_list,
-                                       branch_count=45)
-        _3 = {}
-        for k, v in _45_default.items():
-            for _v in v:
-                _3[_v] = k
-        _60_default = self.reduce_list(self.__uncc_test_list,
-                                       branch_count=60)
-        _4 = {}
-        for k, v in _60_default.items():
-            for _v in v:
-                _4[_v] = k
-        
-        _15_avoid = self.reduce_list(self.__uncc_test_list,
-                                     branch_count=15,
-                                     avoid_roots=True)
-        _5 = {}
-        for k, v in _15_avoid.items():
-            for _v in v:
-                _5[_v] = k
-        _30_avoid = self.reduce_list(self.__uncc_test_list,
-                                     branch_count=30,
-                                     avoid_roots=True)
-        _6 = {}
-        for k, v in _30_avoid.items():
-            for _v in v:
-                _6[_v] = k
-        _45_avoid = self.reduce_list(self.__uncc_test_list,
-                                     branch_count=45,
-                                     avoid_roots=True)
-        _7 = {}
-        for k, v in _45_avoid.items():
-            for _v in v:
-                _7[_v] = k
-        _60_avoid = self.reduce_list(self.__uncc_test_list,
-                                     branch_count=60,
-                                     avoid_roots=True)
-        _8 = {}
-        for k, v in _60_avoid.items():
-            for _v in v:
-                _8[_v] = k
-        
-        _15_2range = self.reduce_list(self.__uncc_test_list,
-                                      branch_count=15,
-                                      range_width=2,
-                                      avoid_roots=True,
-                                      path_lengths=[1])
-        _9 = {}
-        for k, v in _15_2range.items():
-            for _v in v:
-                _9[_v] = k
-        _30_2range = self.reduce_list(self.__uncc_test_list,
-                                      branch_count=30,
-                                      range_width=2,
-                                      avoid_roots=True,
-                                      path_lengths=[1,2])
-        _10 = {}
-        for k, v in _30_2range.items():
-            for _v in v:
-                _10[_v] = k
-        _45_2range = self.reduce_list(self.__uncc_test_list,
-                                      branch_count=45,
-                                      range_width=2,
-                                      dijkstra_lengths=[1,2,3])
-        _11 = {}
-        for k, v in _45_2range.items():
-            for _v in v:
-                _11[_v] = k
-        _45_3range = self.reduce_list(self.__uncc_test_list,
-                                      branch_count=45,
-                                      range_width=3,
-                                      dijkstra_lengths=[1,2,3])
-        _12 = {}
-        for k, v in _45_3range.items():
-            for _v in v:
-                _12[_v] = k
-        
-        with open('uncc_test_go_mapping.csv', 'w') as fh:
-            fh.write('go_term,15_default,30_default,45_default,60_default'
-                     + '15_avoid_roots=True,30_avoid_roots=True,'
-                     + '45_avoid_roots=True,60_avoid_roots=True,'
-                     + '15_range_width=2|avoid_roots=True|path_lengths=[1],'
-                     + '30_range_width=2|avoid_roots=True|path_lenghts=[1|2],'
-                     + '45_range_width=2|dijkstra_lengths=[1|2|3],'
-                     + '45_range_width=3|dijkstra_lengths=[1|2|3]\n')
-            for go_term in sorted(self.obo_graph.nodes()):
-                fh.write(go_term)
-                for map in [_1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12]:
-                    fh.write(',')
-                    if go_term in map:
-                        fh.write(map[go_term])
-                    else:
-                        fh.write(go_term)
-                fh.write('\n')
+        if self.verbose:
+            byte_count = float(asizeof(self))
+            Mbyte_count = byte_count / 10 ** 6
+            
+            print (('Memory used to store parse_obo object: %d bytes.'
+                    + ' (%0.2f megabytes)')
+                   % (byte_count, Mbyte_count))
 
     ### METHODS PAST THIS POINT REQUIRE OBO_DETAIL IN ORDER TO RUN ###
+    ###            AND SHOULD BE TREATED AS DEPRECATED.            ###
 
-    def dump_obo_detail_to_file(self, filename='go-detail.json'):
+    def __dump_obo_detail_to_file(self, filename='go-detail.json'):
         if not self.save_detail is True or self.obo_detail is {}:
             raise NotImplementedError, ('Not implemented when save_detail flag'
                                         + ' is set to False.')
@@ -1333,13 +1412,13 @@ class parse_obo():
                                 separators=(',', ': '),
                                 cls=SimpleSafeJSON))
 
-    def dump_pseudotree_to_file(self, filename='go.json'):
+    def __dump_pseudotree_to_file(self, filename='go.json'):
         if not self.save_detail is True or self.obo_detail is {}:
             raise NotImplementedError, ('Not implemented when save_detail flag'
                                         + ' is set to False.')
         
         tree = {}
-        for r in self.obo_root:
+        for r in self.roots:
             tree[r] = {}
         for k, v in self.obo_detail.items():
             if v['root']:
@@ -1350,9 +1429,7 @@ class parse_obo():
                                 indent=2,
                                 separators=(',', ': ')))
 
-    ### METHODS PAST THIS POINT ARE DEPRECIATED AND RELY ON OBO_DETAIL ###
-
-    def reduce_list_by_detail(self, go_list=[], branch_count=20, weights=None):
+    def __reduce_list_by_detail(self, go_list=[], branch_count=20, weights=None):
         raise NotImplementedError
         
         if not self.save_detail is True or self.obo_detail is {}:
@@ -1367,7 +1444,7 @@ class parse_obo():
             print 'Provided weights must be stored as a non-empty dictionary'
             print 'with the following format:'
             print '  {'
-            for relation in self.obo_relations:
+            for relation in self.relations:
                 print "    '" + str(relation) + "': #,"
             print '  }'
             print 'If a relation is left out of the weights dictionary, it'
@@ -1381,7 +1458,7 @@ class parse_obo():
             return TypeError('User provided improperly formatted go term list.')
         
         for k in weights:
-            if k not in self.obo_relations:
+            if k not in self.relations:
                 weights.pop(k)
                 print ('"' + str(k) + '" is not a valid relation type and will'
                        + ' be ignored. (!)')
@@ -1390,18 +1467,18 @@ class parse_obo():
         
         return res
 
-    def find_lsca_by_detail(self, go_1, go_2, weights=None):
+    def __find_lsca_by_detail(self, go_1, go_2, weights=None):
         if not self.save_detail is True or self.obo_detail is {}:
             raise NotImplementedError, ('Not implemented when save_detail flag'
                                         + ' is set to False.')
         
         if weights is None:
             weights = self.weights
-        if set(weights.keys()) == set(self.obo_disjoint):
+        if set(weights.keys()) == set(self.disjoint):
             if ((go_1 in self.obo_detail and go_2 in self.obo_detail)
                  and self.obo_detail[go_1]['root']
                  and self.obo_detail[go_2]['root']
-                 and (self.obo_detail[go_1]['root'] ==
+                 and (self.obo_detail[go_1]['root'] == 
                       self.obo_detail[go_2]['root'])):
                 pass
             else:
@@ -1439,7 +1516,7 @@ class parse_obo():
         
         return (res_id, res_depth, res_score)
     
-    def _lsca_run_test(self, option_list=None, weights=None,
+    def ___lsca_run_test(self, option_list=None, weights=None,
                        num_threads=None, verbose=False):
         
         if not self.save_detail is True or self.obo_detail is {}:
@@ -1452,7 +1529,7 @@ class parse_obo():
                 return (r_id, r_dp, r_sc, go_1, go_2)
         
         def cbrt(x):
-            return math.pow(x, 1.0/3.0)
+            return math.pow(x, 1.0 / 3.0)
         
         class print_thread(threading.Thread):
             def __init__(self, p, t=1):
@@ -1468,18 +1545,11 @@ class parse_obo():
                     try:
                         n, s, f = self.print_queue.get(timeout=self.timeout)
                         if self.last_caller and n != self.last_caller:
-                            self.fprint('\n', None)
+                            fprint('\n', None)
                         self.last_caller = n
-                        self.fprint(s=s, f=f)
+                        fprint(s=s, f=f)
                     except Queue.Empty:
                         pass
-            
-            def fprint(self, s, f=()):
-                if not f:
-                    f = ()
-                sys.stdout.write('\r')
-                sys.stdout.write(s.replace('\t', '    ') % f)
-                sys.stdout.flush()
             
             def terminate(self):
                 self.running = False
@@ -1594,7 +1664,7 @@ class parse_obo():
             _t = run_test_thread(thread_requests,
                                  thread_response,
                                  thread_messages,
-                                 name='Process-'+str(i),
+                                 name='Process-' + str(i),
                                  verbose=verbose)
             threads.append(_t)
             _t.start()
@@ -1607,9 +1677,9 @@ class parse_obo():
             if option_list:
                 options = frozenset(
                   [option for option in option_list
-                   if option in self.obo_graph.nodes()])
+                   if option in self.graph.nodes()])
             else:
-                options = frozenset(self.obo_graph.nodes())
+                options = frozenset(self.graph.nodes())
         else:
             if option_list:
                 options = frozenset(
@@ -1623,7 +1693,7 @@ class parse_obo():
 
         tested = set()
         count = 0
-        total = len(options)*(len(options)+1)*0.5
+        total = len(options) * (len(options) + 1) * 0.5
         mod = math.floor(cbrt(total))
         
         thread_messages.put(('MainThread',
@@ -1646,14 +1716,14 @@ class parse_obo():
                     thread_messages.put(
                       ('MainThread',
                        'Prepared  %d of %d possible combinations. (%0.5f%%)',
-                       (count, total, float(count)/total*100))
+                       (count, total, float(count) / total * 100))
                     )
                 thread_requests.put((_1, _2))
             tested.add(_1)
         thread_messages.put(
           ('MainThread',
            'Prepared  %d of %d possible combinations. (%0.5f%%)\n',
-           (count, total, float(count)/total*100))
+           (count, total, float(count) / total * 100))
         )
         
         while not thread_requests.empty():
@@ -1662,7 +1732,7 @@ class parse_obo():
                'Processed %d of %d possible combinations. (%0.5f%%)',
                (total - thread_requests.qsize(),
                 total,
-                float(total - thread_requests.qsize())/total*100))
+                float(total - thread_requests.qsize()) / total * 100))
             )
             time.sleep(capture_thread.sleep_time() * mod)
         thread_messages.put(
@@ -1670,7 +1740,7 @@ class parse_obo():
            'Processed %d of %d possible combinations. (%0.5f%%)\n',
            (total - thread_requests.qsize(),
             total,
-            float(total - thread_requests.qsize())/total*100))
+            float(total - thread_requests.qsize()) / total * 100))
         )
         
         while capture_thread.finished() < total:
@@ -1679,7 +1749,7 @@ class parse_obo():
                'Stored    %d of %d possible combinations. (%0.5f%%)',
                (capture_thread.finished(),
                 total,
-                float(capture_thread.finished())/total*100))
+                float(capture_thread.finished()) / total * 100))
             )
             time.sleep(capture_thread.sleep_time() * mod)
         thread_messages.put(
@@ -1687,7 +1757,7 @@ class parse_obo():
            'Stored    %d of %d possible combinations. (%0.5f%%)\n',
            (capture_thread.finished(),
             total,
-            float(capture_thread.finished())/total*100))
+            float(capture_thread.finished()) / total * 100))
         )
         
         thread_messages.put(
@@ -1730,3 +1800,14 @@ class SimpleSafeJSON(json.JSONEncoder):
                 return json.JSONEncoder.default(self, obj)
             except:
                 return json.JSONEncoder.default(self, safe_method(obj))
+
+def fprint(s, f=()):
+    try:
+        sys.stdout.write('\r')
+        sys.stdout.write(s.replace('\t', '    ') % f)
+        sys.stdout.flush()
+    except:
+        print 'Attempted: %s, formatted with' % str(s)
+        for _f in f:
+            print '    %s (type: %s)' % (str(_f), str(type(_f)))
+        print traceback.format_exc
