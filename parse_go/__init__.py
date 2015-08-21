@@ -17,12 +17,14 @@ import json
 import math
 import multiprocessing
 import networkx
+import numbers
 import psutil
 import shutil
 import sys
 import threading
 import time
 import traceback
+import types
 import urllib
 
 
@@ -40,7 +42,7 @@ class parse_obo(object):
                        disjoint=['is_a'],
                        source_path=None,
                        save_detail=False,
-                       verbose=True):
+                       verbose=False):
         # Note: the algorithms herein assume that those terms in
         #   self.roots are root nodes for the entire go graph,
         #   and that the relations listed in self.relations
@@ -58,6 +60,7 @@ class parse_obo(object):
         self.source_path = source_path
         self.save_detail = save_detail
         self.verbose = verbose
+        self._downloaded_obo = False
         obo_handle = self._prepare_file(self.source_path)
         try:
             self._parse_file(obo_handle, self.save_detail)
@@ -66,6 +69,17 @@ class parse_obo(object):
             pass
         finally:
             obo_handle.close()
+        if self._downloaded_obo:
+            try:
+                if self.date:
+                    timestamp = self.date.strftime('_%Y-%m-%d_%H-%M')
+                else:
+                    timestamp = time.strftime('_%Y-%m-%d_%H-%M')
+                shutil.copyfile('go.obo', 'go%s.obo' % timestamp)
+                print 'Copy saved as go%s.obo for future reference.' % timestamp
+            except:
+                raise IOError, 'Failed to backup gene ontology source file.'
+        
         self.__uncc_test_list = ['GO:0046439', 'GO:0034605', 'GO:0030123',
                                  'GO:0005838', 'GO:0005839', 'GO:0005834',
                                  'GO:0051493', 'GO:0005833', 'GO:0003735',
@@ -778,29 +792,64 @@ class parse_obo(object):
         except:
             pass
 
-    def reduce_dict(self, go_terms={}, branch_count=20, avoid_roots=False,
+    def reduce_dict(self, go_terms={}, branch_count=[20], avoid_roots=False,
                                        range_modifier=0.25, range_width=1,
                                        path_lengths=[], dijkstra_lengths=[],
                                        verbose=0):
+        if isinstance(branch_count, numbers.Number):
+            branch_count = [int(branch_count)]
+        if isinstance(branch_count, list):
+            try:
+                assert(len(branch_count) > 0)
+            except:
+                raise ValueError
+            try:
+                assert(all(isinstance(b, (int, types.NoneType))
+                           for b in branch_count))
+            except:
+                raise TypeError
+        else:
+            raise TypeError
+        
+        current_branch_count = branch_count[0]
+        next_branch_count = branch_count[1:]
+        
         if isinstance(go_terms, dict):
             for k in go_terms:
                 go_terms[k] = self.reduce_dict(go_terms[k],
-                                               branch_count=branch_count,
+                                               branch_count=next_branch_count,
                                                avoid_roots=avoid_roots,
                                                range_modifier=range_modifier,
                                                range_width=range_width,
                                                path_lengths=path_lengths,
                                                dijkstra_lengths=dijkstra_lengths,
                                                verbose=verbose)
+#            if current_branch_count:
+#                weights = {}
+#                for k in go_terms:
+#                    go_terms[k] = sum(go_terms[k].values(), [])
+#                    weights[k] = collections.Counter(go_terms[k])
+#                    go_terms[k] = self.reduce_list(weights[k].keys(),
+#                                                   branch_count=current_branch_count,
+#                                                   avoid_roots=avoid_roots,
+#                                                   range_modifier=range_modifier,
+#                                                   range_width=range_width,
+#                                                   path_lengths=path_lengths,
+#                                                   dijkstra_lengths=dijkstra_lengths,
+#                                                   verbose=verbose)
+            return go_terms
         elif isinstance(go_terms, list):
-            return self.reduce_list(go_terms,
-                                    branch_count=branch_count,
-                                    avoid_roots=avoid_roots,
-                                    range_modifier=range_modifier,
-                                    range_width=range_width,
-                                    path_lengths=path_lengths,
-                                    dijkstra_lengths=dijkstra_lengths,
-                                    verbose=verbose)
+            if current_branch_count:
+                return self.reduce_list(go_terms,
+                                        branch_count=current_branch_count,
+                                        avoid_roots=avoid_roots,
+                                        range_modifier=range_modifier,
+                                        range_width=range_width,
+                                        path_lengths=path_lengths,
+                                        dijkstra_lengths=dijkstra_lengths,
+                                        verbose=verbose)
+            else:
+                return go_terms
         else:
             raise TypeError
 
@@ -808,8 +857,11 @@ class parse_obo(object):
                                        range_modifier=0.25, range_width=1,
                                        path_lengths=[], dijkstra_lengths=[],
                                        verbose=0):
+        if len(go_terms) < 2:
+            return go_terms
+        
         if self.verbose:
-            verbose = max(1, verbose)
+            verbose = max(1, self.verbose)
         if verbose > 0:
             from pprint import pprint
         
@@ -817,6 +869,9 @@ class parse_obo(object):
                          if go_id in self.graph.nodes()])
         
         flow_counts = self._generate_flow_count(remaining, branch_count)
+        
+        if branch_count > len(go_terms) - 1:
+            branch_count = len(go_terms) - 1
         
         result_sets = {}
         flow_roots = {}
@@ -838,37 +893,25 @@ class parse_obo(object):
                     flow_counts.pop(go_id)
         
         floor = range_width
-        ceiling = range_width
-        stuck = 0
         iteration = 0
         
-        while len(remaining) > 0 or len(flow_counts) < 1:
+        while (0 < len(remaining) or len(flow_counts) < 1):
             iteration += 1
+            if verbose > 1:
+                print 'Iteration: %d:' % iteration,
             adjust = True
-            possibilities = [(x, len(y), self._get_root_dijkstra(x),
+            possibilities = [(x, len(y), self._get_root_distance(x),
                               sum(self.find_lsca(x, _y)[2] for _y in y))
                              for x, y in flow_counts.items()
-                             if (len(y) > branch_optimal * (floor - range_modifier)
-                                 and len(y) < branch_optimal * (
-                                                    ceiling + range_modifier)
-                            )]
+                             if (self._get_root_distance(x) < float('inf')
+                                 and len(y) > max(2, branch_optimal * floor))]
             if possibilities:
-                stuck = 0
                 possibilities = sorted(possibilities,
-                                       key=lambda x : (x[1]),
+                                       key=lambda x : (-x[3] / x[1], x[2]),
                                        reverse=True)
                 current = possibilities[0]
-                if verbose > 1:
-                    print 'Iteration: %d:' % iteration
-                    print (len(remaining),
-                           self._get_root_distance_tuple(current[0]))
-                    if verbose > 2:
-                        pprint(possibilities)
-                    print ''
-                if current[1] > 1:
-                    current = current[0]
-                else:
-                    break
+                current = current[0]
+                selected = current
                 result_sets[current] = flow_counts[current]
                 current = frozenset(flow_counts.pop(current))
                 remaining = remaining - current
@@ -877,36 +920,47 @@ class parse_obo(object):
                     if len(flow_counts[node]) < 1:
                         flow_counts.pop(node)
                 adjust = False
+                if verbose > 1:
+                    print ('selected %s, %s remaining.' % 
+                           (selected, len(remaining)))
+                    if verbose > 2:
+                        pprint(possibilities)
             if adjust:
-                if floor < ceiling:
-                    floor -= range_modifier
-                else:
-                    ceiling += range_modifier
-                
-                if stuck > 9:
+                if branch_optimal * floor < 2:
+                    if verbose > 1:
+                        print 'unable to reduce further.'
                     break
-                else:
-                    stuck += 1
+                if verbose > 1:
+                    print 'no results, adjusting floor: (%.2f) ->' % floor,
+                floor -= range_modifier
+                
+                if verbose > 1:
+                    print '(%.2f)' % floor
+            if verbose > 2:
+                print ''
         
         if verbose > 0:
+            if verbose > 1:
+                print ''
             print 'Reduction list contains %d terms.' % len(result_sets)
-            pprint(sorted([(r,
-                            self._get_root_distance_tuple(r),
-                            len(result_sets[r]),
-                            self.obo_detail[r]['name'] if self.save_detail
-                                                       else '')
-                           for r in result_sets],
-                          key=lambda x : x[2],
-                          reverse=True))
-            if verbose > 3:
-                print 'Unable to reduce %d terms.' % len(remaining)
+            if verbose > 1:
+                pprint(sorted([(r,
+                                self._get_root_distance_tuple(r),
+                                len(result_sets[r]),
+                                self.obo_detail[r]['name'] if self.save_detail
+                                                           else '')
+                               for r in result_sets],
+                              key=lambda x : x[2],
+                              reverse=True))
+            print 'Unable to reduce %d terms.' % len(remaining)
+            if verbose > 1:
                 pprint([(r,
                          self._get_root_distance_tuple(r),
                          self.obo_detail[r]['name'] if self.save_detail
                                                     else '')
                        for r in remaining])
         
-        return result_sets
+        return list(result_sets), list(remaining)
     
     def _generate_flow_count(self, go_list, branch_count=20):
         flow_path = {}
@@ -1161,17 +1215,13 @@ class parse_obo(object):
             finally:
                 print 'Cannot locate gene ontology source file.'
                 print 'Attempting to download source file now.'
-                filename = 'go_%s.obo' % time.strftime('%m%d%Y')
+                filename = 'go.obo'
                 try:
                     self.fetch_update(filepath=filename)
                     print 'Source file downloaded. Saved as %s.' % filename
                 except:
                     raise IOError, 'Failed to download gene ontology source file.'
-                try:
-                    shutil.copyfile(filename, 'go.obo')
-                    print 'Copy saved as go.obo for future use.'
-                except:
-                    raise IOError, 'Failed to backup gene ontology source file.'
+                self._downloaded_obo = True
                 return self._prepare_file(filepath=filename)
         return fh
 
